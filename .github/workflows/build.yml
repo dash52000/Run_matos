@@ -2,7 +2,7 @@ name: Build APK
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   workflow_dispatch:
 
 permissions:
@@ -26,24 +26,40 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
 
+      - name: Tests unitaires
+        run: ./gradlew testDebugUnitTest --no-daemon 2>&1 | tee test.log
+
       # En cas d'échec, remonte les erreurs comme annotations lisibles sur le commit.
       - name: Résumer les erreurs
         if: failure()
         run: |
           set +e
           esc() { sed -e 's/%/%25/g' | sed -e ':a;N;$!ba;s/\r/%0D/g;s/\n/%0A/g'; }
-          grep -E '^e: ' build.log | head -15 | while IFS= read -r line; do
-            echo "::error title=Kotlin::$(printf '%s' "$line" | esc)"
+          if [ -f build.log ]; then
+            grep -E '^e: ' build.log | head -15 | while IFS= read -r line; do
+              echo "::error title=Kotlin::$(printf '%s' "$line" | esc)"
+            done
+            wrong=$(awk '/What went wrong/{f=1} f{print} /^\* Try:/{if(f) exit}' build.log | head -60 | esc)
+            if [ -n "$wrong" ]; then echo "::error title=Gradle::$wrong"; fi
+          fi
+          if [ -f test.log ]; then
+            grep -n -A 12 'FAILED' test.log | head -120 | esc | { read -r t; [ -n "$t" ] && echo "::error title=Tests::$t"; }
+            for f in app/build/test-results/testDebugUnitTest/*.xml; do
+              [ -f "$f" ] || continue
+              grep -A 6 '<failure' "$f" | head -40 | esc | { read -r t; [ -n "$t" ] && echo "::error title=Test $(basename "$f")::$t"; }
+            done
+          fi
+          for log in build.log test.log; do
+            [ -f "$log" ] && tail -n 40 "$log" | esc | { read -r t; echo "::warning title=Fin de $log::$t"; }
           done
-          wrong=$(awk '/What went wrong/{f=1} f{print} /^\* Try:/{if(f) exit}' build.log | head -60 | esc)
-          if [ -n "$wrong" ]; then echo "::error title=Gradle::$wrong"; fi
-          tail -n 40 build.log | esc | { read -r t; echo "::warning title=Fin du log::$t"; }
           exit 0
 
       - name: Préparer l'APK
+        if: github.ref == 'refs/heads/main'
         run: cp app/build/outputs/apk/debug/app-debug.apk run-matos.apk
 
       - name: Publier la Release
+        if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.${{ github.run_number }}
