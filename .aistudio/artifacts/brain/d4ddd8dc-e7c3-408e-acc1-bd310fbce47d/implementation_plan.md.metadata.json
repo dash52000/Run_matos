@@ -1,0 +1,6 @@
+{
+  "summary":  "Plan complet de correction de toutes les failles de robustesse identifiées :\n- Résilience réseau Open-Meteo et géocodage avec résolveur DNS de secours\n- Assainissement strict et sécurisation mémoire du parsing GPX (coordonnées NaN, pics d'altitude, fichiers géants)\n- Dialogue de confirmation avant suppression d'une paire de chaussures et nettoyage des références orphelines\n- Sécurisation des saisies numériques et protections anti-division par zéro",
+  "updatedAt":  "2026-10-23T11:30:16.389844153Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

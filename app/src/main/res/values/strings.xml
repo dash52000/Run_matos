@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">RunCoach Matos</string>
+    <string name="widget_description">Affiche la prochaine sortie : température de référence, tenue résumée et alertes (boue, pluie, UV).</string>
+    <string name="tab_run">Sortie</string>
+    <string name="tab_gear">Mon matos</string>
+    <string name="tab_history">Historique</string>
+    <string name="tab_season">Bilan</string>
+</resources>

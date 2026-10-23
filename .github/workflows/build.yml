@@ -1,0 +1,55 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Compiler l'APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      # En cas d'échec, remonte les erreurs comme annotations lisibles sur le commit.
+      - name: Résumer les erreurs
+        if: failure()
+        run: |
+          set +e
+          esc() { sed -e 's/%/%25/g' | sed -e ':a;N;$!ba;s/\r/%0D/g;s/\n/%0A/g'; }
+          grep -E '^e: ' build.log | head -15 | while IFS= read -r line; do
+            echo "::error title=Kotlin::$(printf '%s' "$line" | esc)"
+          done
+          wrong=$(awk '/What went wrong/{f=1} f{print} /^\* Try:/{if(f) exit}' build.log | head -60 | esc)
+          if [ -n "$wrong" ]; then echo "::error title=Gradle::$wrong"; fi
+          tail -n 40 build.log | esc | { read -r t; echo "::warning title=Fin du log::$t"; }
+          exit 0
+
+      - name: Préparer l'APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk run-matos.apk
+
+      - name: Publier la Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Run Matos 1.0.${{ github.run_number }}
+          body: |
+            Télécharge `run-matos.apk` depuis ton téléphone et ouvre-le pour l'installer.
+            Commit : ${{ github.sha }}
+          files: run-matos.apk
+          make_latest: true

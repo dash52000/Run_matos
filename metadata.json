@@ -1,0 +1,6 @@
+{
+  "name": "RunCoach Matos",
+  "description": "Assistant météo, équipement, chaussures, nutrition et rétroplanning pour la course sur route et le trail.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
