@@ -19,7 +19,17 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
+import com.example.data.local.SurfaceCacheStore
+import com.example.data.model.GpxColoredSegment
+import com.example.data.model.GpxSurfaceBreakdown
+import okhttp3.ResponseBody.Companion.toResponseBody
+import retrofit2.HttpException
+import retrofit2.Response
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
@@ -27,6 +37,52 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
 class GpxAndBackupTest {
+
+    @get:Rule
+    val tmp = TemporaryFolder()
+
+    private fun sampleBreakdown(error: String? = null, manual: Boolean = false) = GpxSurfaceBreakdown(
+        bitumeMeters = 3000.0,
+        cheminStabiliseMeters = 2000.0,
+        terreForetMeters = 5000.0,
+        inconnuMeters = 700.0,
+        totalMeters = 10700.0,
+        bitumePercent = 28.0,
+        cheminStabilisePercent = 18.7,
+        terreForetPercent = 46.7,
+        inconnuPercent = 6.5,
+        isUnreliable = false,
+        coloredSegments = listOf(GpxColoredSegment(49.56, 5.53, 49.561, 5.531, 130.0, SurfaceCategory.TERRE_FORET)),
+        overpassError = error,
+        isManualOrOfflineEstimate = manual
+    )
+
+    @Test
+    fun surface_cache_keeps_real_osm_analyses_only() {
+        val store = SurfaceCacheStore(tmp.newFolder("surface"))
+        store.save("abcdef0123456789", sampleBreakdown())
+        assertEquals(sampleBreakdown(), store.load("abcdef0123456789"))
+
+        store.save("0000aaaa", sampleBreakdown(error = "Serveurs saturés"))
+        assertNull(store.load("0000aaaa"))
+        store.save("1111bbbb", sampleBreakdown(manual = true))
+        assertNull(store.load("1111bbbb"))
+        assertNull(store.load("../etc"))
+    }
+
+    @Test
+    fun saturated_servers_are_reported_as_such() {
+        val busy = HttpException(Response.error<Any>(504, "".toResponseBody(null)))
+        assertEquals(GpxAndOverpassAnalyzer.AttemptOutcome.BUSY, GpxAndOverpassAnalyzer.classifyFailure(busy))
+        assertEquals(GpxAndOverpassAnalyzer.AttemptOutcome.TIMEOUT, GpxAndOverpassAnalyzer.classifyFailure(SocketTimeoutException()))
+        assertEquals(GpxAndOverpassAnalyzer.AttemptOutcome.OFFLINE, GpxAndOverpassAnalyzer.classifyFailure(UnknownHostException()))
+
+        val msg = GpxAndOverpassAnalyzer.failureMessage(
+            listOf(GpxAndOverpassAnalyzer.AttemptOutcome.TIMEOUT, GpxAndOverpassAnalyzer.AttemptOutcome.BUSY), 2
+        )
+        assertTrue(msg.contains("saturés"))
+        assertTrue(GpxAndOverpassAnalyzer.overpassEndpoints.none { it.contains("osm.ch") })
+    }
 
     private fun trkpts(points: List<Triple<Double, Double, Double>>): String =
         points.joinToString("\n") { (lat, lon, ele) -> """<trkpt lat="$lat" lon="$lon"><ele>$ele</ele></trkpt>""" }

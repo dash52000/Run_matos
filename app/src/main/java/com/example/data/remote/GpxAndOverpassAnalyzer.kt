@@ -20,7 +20,11 @@ import retrofit2.http.GET
 import retrofit2.http.POST
 import retrofit2.http.Query
 import retrofit2.http.Url
-import java.io.IOException
+import com.example.data.local.SurfaceCacheStore
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import retrofit2.HttpException
+import java.io.InterruptedIOException
 import java.io.StringReader
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
@@ -71,12 +75,23 @@ object GpxAndOverpassAnalyzer {
     // Cache mémoire des analyses de revêtement réussies par hash de trace pour ne pas refaire l'appel
     private val surfaceAnalysisCache = ConcurrentHashMap<String, GpxSurfaceBreakdown>()
 
-    // Serveurs Overpass publics à couverture mondiale (wiki OSM) avec bascule automatique.
+    // Serveurs Overpass publics à couverture mondiale (wiki OSM), essayés dans l'ordre avec bascule.
     // (overpass.osm.ch, utilisé auparavant en premier, ne couvre que la Suisse : il renvoyait une réponse vide.)
-    private val overpassEndpoints = listOf(
+    // Mesuré le 23/10/2026 (zone Virton, 939 voies) : 26 à 34 s de réponse quand les serveurs sont chargés,
+    // ou refus immédiat 502/504 « at capacity ». D'où le délai de lecture long et le second passage.
+    internal val overpassEndpoints = listOf(
         "https://overpass-api.de/api/interpreter",
+        "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+        "https://lz4.overpass-api.de/api/interpreter",
+        "https://z.overpass-api.de/api/interpreter",
         "https://overpass.private.coffee/api/interpreter"
     )
+
+    /** Délai serveur demandé dans la requête : bas pour être accepté plus souvent par un serveur chargé. */
+    internal const val QUERY_TIMEOUT_SECONDS = 25
+
+    /** Budget total de l'analyse (tous serveurs et passages confondus). */
+    private const val TOTAL_BUDGET_MILLIS = 4L * 60L * 1000L
 
     private val moshi: Moshi = Moshi.Builder()
         .add(KotlinJsonAdapterFactory())
@@ -93,11 +108,13 @@ object GpxAndOverpassAnalyzer {
         chain.proceed(request)
     }
 
+    // Un serveur chargé met souvent ~30 s à répondre (file d'attente + calcul) : on attend jusqu'à 75 s.
     private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
         .addInterceptor(userAgentInterceptor)
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(25, TimeUnit.SECONDS)
-        .writeTimeout(8, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(75, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .callTimeout(90, TimeUnit.SECONDS)
         .build()
 
     private val overpassService: OverpassApiService by lazy {
@@ -281,21 +298,46 @@ object GpxAndOverpassAnalyzer {
         }
     }
 
+    /** Résultat d'une tentative sur un serveur. */
+    internal enum class AttemptOutcome { SUCCESS, EMPTY, BUSY, TIMEOUT, OFFLINE, OTHER_ERROR }
+
+    internal fun classifyFailure(e: Throwable): AttemptOutcome = when (e) {
+        is HttpException -> if (e.code() in setOf(429, 502, 503, 504)) AttemptOutcome.BUSY else AttemptOutcome.OTHER_ERROR
+        is SocketTimeoutException, is InterruptedIOException -> AttemptOutcome.TIMEOUT
+        is UnknownHostException -> AttemptOutcome.OFFLINE
+        else -> AttemptOutcome.OTHER_ERROR
+    }
+
+    internal fun failureMessage(outcomes: Collection<AttemptOutcome>, attempts: Int): String = when {
+        outcomes.isEmpty() -> "Serveurs OpenStreetMap non interrogés."
+        outcomes.all { it == AttemptOutcome.OFFLINE } -> "Hors-ligne : serveurs OpenStreetMap injoignables."
+        outcomes.all { it == AttemptOutcome.EMPTY } -> "Aucune voie OpenStreetMap trouvée autour de la trace."
+        outcomes.any { it == AttemptOutcome.BUSY || it == AttemptOutcome.TIMEOUT } ->
+            "Serveurs OpenStreetMap saturés ($attempts tentatives sans réponse à temps). Réessaie un peu plus tard."
+        else -> "Serveurs OpenStreetMap momentanément indisponibles."
+    }
+
     /**
      * Interroge l'API Overpass dans l'emprise de la trace + 50 m pour récupérer les voies (ways)
      * avec leurs tags highway, surface et tracktype.
-     * - Pour éviter les timeouts (504) sur de grandes traces, découpe l'emprise en sous-boîtes + 50 m
-     *   le long du corridor de la trace lorsque la diagonale dépasse 3,5 km.
-     * - Interroge plusieurs serveurs Overpass publics (couverture mondiale) en cas d'indisponibilité.
-     * - Si aucun serveur ne répond, renvoie un revêtement 100 % « inconnu » avec le message d'erreur :
-     *   aucune répartition n'est inventée, et ce résultat n'est pas mis en cache pour pouvoir réessayer.
+     * - Découpe l'emprise en sous-boîtes le long du corridor de la trace si elle est grande.
+     * - Essaie plusieurs serveurs publics, en deux passages espacés, dans un budget de 4 min :
+     *   les serveurs publics sont souvent saturés (réponse en ~30 s ou refus « at capacity »).
+     * - Une analyse réussie est gardée en mémoire et sur disque ([persistentCache]) : plus besoin du réseau ensuite.
+     * - Si rien ne répond, renvoie un revêtement 100 % « inconnu » avec le message : aucune répartition
+     *   n'est inventée, et cet échec n'est pas mis en cache pour pouvoir réessayer.
      */
     suspend fun analyzeSurfaceWithOverpass(
         track: GpxTrackAnalysis,
-        forceRefresh: Boolean = false
+        forceRefresh: Boolean = false,
+        persistentCache: SurfaceCacheStore? = null
     ): GpxSurfaceBreakdown {
         if (!forceRefresh) {
             surfaceAnalysisCache[track.trackIdHash]?.let { return it }
+            persistentCache?.load(track.trackIdHash)?.let {
+                surfaceAnalysisCache[track.trackIdHash] = it
+                return it
+            }
         } else {
             surfaceAnalysisCache.remove(track.trackIdHash)
         }
@@ -303,51 +345,45 @@ object GpxAndOverpassAnalyzer {
         val pts = track.points
         val rawSegments = buildTrackSegments(pts)
         val totalMeters = rawSegments.sumOf { it.lengthMeters }.coerceAtLeast(1.0)
+        val query = buildOptimizedOverpassQuery(pts)
 
-        var lastError: Exception? = null
-        var gotEmptyAnswer = false
+        val startedAt = System.currentTimeMillis()
+        val outcomes = mutableListOf<AttemptOutcome>()
 
-        for (query in listOf(buildOptimizedOverpassQuery(pts), buildSingleBboxOverpassQuery(pts)).distinct()) {
+        for (round in 0 until 2) {
+            if (round > 0) delay(5_000L)
             for (endpoint in overpassEndpoints) {
+                if (System.currentTimeMillis() - startedAt > TOTAL_BUDGET_MILLIS) break
                 try {
-                    val response = try {
-                        overpassService.queryOverpassPost(endpoint, query)
-                    } catch (_: Exception) {
-                        overpassService.queryOverpassGet(endpoint, query)
-                    }
+                    val response = overpassService.queryOverpassPost(endpoint, query)
                     val ways = response.elements.orEmpty()
                         .filter { it.type == "way" && !it.geometry.isNullOrEmpty() }
                         .distinctBy { it.id }
                     if (ways.isEmpty()) {
-                        // Réponse vide : on tente le serveur suivant plutôt que de conclure « 100 % inconnu ».
-                        gotEmptyAnswer = true
+                        // Réponse vide (ou requête coupée côté serveur) : on tente le serveur suivant.
+                        outcomes.add(AttemptOutcome.EMPTY)
                         continue
                     }
-
                     val result = computeSurfaceBreakdownFromWays(rawSegments, ways, totalMeters)
                     surfaceAnalysisCache[track.trackIdHash] = result
+                    persistentCache?.save(track.trackIdHash, result)
                     return result
                 } catch (e: Exception) {
-                    lastError = e
+                    if (e is CancellationException) throw e
+                    val outcome = classifyFailure(e)
+                    outcomes.add(outcome)
+                    // Hors-ligne : inutile d'insister sur les autres serveurs.
+                    if (outcome == AttemptOutcome.OFFLINE && outcomes.all { it == AttemptOutcome.OFFLINE }) {
+                        return buildUnknownSurfaceBreakdown(rawSegments, totalMeters, failureMessage(outcomes, outcomes.size) + " Revêtement inconnu, règles chaussures classiques.")
+                    }
                 }
             }
+            // Deux passages seulement si les serveurs étaient saturés (pas s'ils ont répondu « vide »).
+            if (outcomes.none { it == AttemptOutcome.BUSY || it == AttemptOutcome.TIMEOUT }) break
         }
 
-        val message = if (gotEmptyAnswer && lastError == null) {
-            "Aucune voie OpenStreetMap trouvée autour de la trace : revêtement inconnu."
-        } else {
-            formatFriendlyNetworkError(lastError) + " Revêtement inconnu, règles chaussures classiques."
-        }
+        val message = failureMessage(outcomes, outcomes.size) + " Revêtement inconnu, règles chaussures classiques."
         return buildUnknownSurfaceBreakdown(rawSegments, totalMeters, message)
-    }
-
-    private fun formatFriendlyNetworkError(e: Throwable?): String {
-        return when (e) {
-            is UnknownHostException -> "Serveur Overpass injoignable (hors-ligne ?)."
-            is SocketTimeoutException -> "Délai d'attente dépassé (serveur OSM saturé)."
-            is IOException -> "Connexion au serveur OpenStreetMap interrompue."
-            else -> "Serveur Overpass momentanément indisponible."
-        }
     }
 
     /** Revêtement 100 % inconnu (trace grise) quand OSM ne fournit rien : rien n'est estimé. */
@@ -462,7 +498,7 @@ object GpxAndOverpassAnalyzer {
 
         val unionBody = bboxClauses.distinct().joinToString("\n  ")
         return """
-            [out:json][timeout:18];
+            [out:json][timeout:$QUERY_TIMEOUT_SECONDS];
             (
               $unionBody
             );
@@ -487,7 +523,7 @@ object GpxAndOverpassAnalyzer {
         val east = String.format(Locale.US, "%.6f", maxLon + padLon)
 
         return """
-            [out:json][timeout:18];
+            [out:json][timeout:$QUERY_TIMEOUT_SECONDS];
             way["highway"]($south,$west,$north,$east);
             out tags geom;
         """.trimIndent()

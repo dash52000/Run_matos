@@ -251,7 +251,7 @@ fun GpxSurfaceAnalysisCard(
 
             if (gpxTrack.isAnalyzingSurface && breakdown == null) {
                 Text(
-                    text = "Interrogation de l'API Overpass (OpenStreetMap, corridor + 50 m, rayon segment 20 m)…",
+                    text = "Interrogation des serveurs OpenStreetMap… Quand ils sont chargés, la réponse peut prendre 1 à 2 min (plusieurs serveurs essayés).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

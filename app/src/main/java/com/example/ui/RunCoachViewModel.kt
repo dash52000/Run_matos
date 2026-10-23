@@ -15,6 +15,7 @@ import com.example.data.local.GearItemEntity
 import com.example.data.local.RunCoachDatabase
 import com.example.data.local.RunHistoryEntity
 import com.example.data.local.ShoeEntity
+import com.example.data.local.SurfaceCacheStore
 import com.example.data.model.BestWeatherSlotSuggestion
 import com.example.data.model.ChecklistType
 import com.example.data.model.GearCategory
@@ -55,6 +56,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -134,6 +136,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
     private val db = RunCoachDatabase.getInstance(application)
     private val dao = db.dao()
     private val prefs = application.getSharedPreferences("runcoach_nutrition_prefs", Context.MODE_PRIVATE)
+    private val surfaceCache = SurfaceCacheStore(File(application.filesDir, "surface_cache"))
 
     private val _formState = MutableStateFlow(NewRunFormState())
     val formState: StateFlow<NewRunFormState> = _formState.asStateFlow()
@@ -537,7 +540,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                     durationMinutes = estDur,
                     gpxTrack = parsed,
                     manualShoeOverrideId = null,
-                    statusBannerMessage = "Trace « ${parsed.trackName} » importée : ${parsed.totalDistanceKm} km • ${parsed.elevationGainDPlusMeters} m D+ • Analyse du revêtement…"
+                    statusBannerMessage = "Trace « ${parsed.trackName} » importée : ${parsed.totalDistanceKm} km • ${parsed.elevationGainDPlusMeters} m D+ • Analyse du revêtement (jusqu'à 1 à 2 min si les serveurs OSM sont chargés)…"
                 )
             }
 
@@ -546,7 +549,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
 
             // Analyse du revêtement via Overpass API (ou cache si déjà analysée)
             val breakdown = withContext(Dispatchers.IO) {
-                GpxAndOverpassAnalyzer.analyzeSurfaceWithOverpass(track = parsed)
+                GpxAndOverpassAnalyzer.analyzeSurfaceWithOverpass(track = parsed, persistentCache = surfaceCache)
             }
             applySurfaceBreakdown(parsed, breakdown)
         }
@@ -582,14 +585,15 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             _formState.update {
                 it.copy(
-                    gpxTrack = currentTrack.copy(isAnalyzingSurface = true),
-                    statusBannerMessage = "Nouvelle tentative d'analyse du revêtement via Overpass…"
+                    gpxTrack = currentTrack.copy(isAnalyzingSurface = true, surfaceBreakdown = null),
+                    statusBannerMessage = "Nouvelle analyse du revêtement : les serveurs OpenStreetMap peuvent mettre 1 à 2 min quand ils sont chargés…"
                 )
             }
             val breakdown = withContext(Dispatchers.IO) {
                 GpxAndOverpassAnalyzer.analyzeSurfaceWithOverpass(
                     track = currentTrack,
-                    forceRefresh = true
+                    forceRefresh = true,
+                    persistentCache = surfaceCache
                 )
             }
             applySurfaceBreakdown(currentTrack, breakdown)
