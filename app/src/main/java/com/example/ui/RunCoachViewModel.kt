@@ -4,46 +4,57 @@ import android.annotation.SuppressLint
 import android.app.Application
 import android.content.Context
 import android.location.Geocoder
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.room.withTransaction
+import com.example.data.local.BackupManager
 import com.example.data.local.ChecklistItemEntity
+import com.example.data.local.DemoDataCleanup
 import com.example.data.local.GearItemEntity
 import com.example.data.local.RunCoachDatabase
 import com.example.data.local.RunHistoryEntity
 import com.example.data.local.ShoeEntity
+import com.example.data.model.BestWeatherSlotSuggestion
 import com.example.data.model.ChecklistType
 import com.example.data.model.GearCategory
 import com.example.data.model.GelFeedback
 import com.example.data.model.GeoLocationResult
-import com.example.data.model.MudLevel
+import com.example.data.model.GpxTrackAnalysis
 import com.example.data.model.RetroplanningConfig
 import com.example.data.model.RunSessionType
 import com.example.data.model.ShoeType
 import com.example.data.model.TerrainType
 import com.example.data.model.ThermalFeeling
-import com.example.data.model.WeatherSlotAnalysis
-import com.example.data.model.GpxTrackAnalysis
-import com.example.data.model.BestWeatherSlotSuggestion
 import com.example.data.model.ThermalProfile
+import com.example.data.model.WeatherSlotAnalysis
 import com.example.data.remote.GpxAndOverpassAnalyzer
 import com.example.data.remote.OpenMeteoClient
+import com.example.data.remote.OpenMeteoForecastResponse
+import com.example.data.remote.WeatherCachePolicy
 import com.example.domain.FullRunRecommendation
 import com.example.domain.RecommendationEngine
-import com.example.notifications.RetroplanningNotificationReceiver
 import com.example.widget.NextRunWidgetProvider
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -51,9 +62,11 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 data class NewRunFormState(
-    val locationName: String = "Chamonix-Mont-Blanc",
-    val latitude: Double = 45.9237,
-    val longitude: Double = 6.8694,
+    /** Faux tant qu'aucun lieu n'a été choisi (ville, GPS ou trace GPX) : pas de météo, pas de reco. */
+    val hasLocation: Boolean = false,
+    val locationName: String = "Aucun lieu choisi",
+    val latitude: Double = 0.0,
+    val longitude: Double = 0.0,
     val dayOffset: Int = 0, // 0 = Aujourd'hui, 1 = Demain, etc.
     val startHour: Int = 9,
     val startMinute: Int = 0,
@@ -66,12 +79,7 @@ data class NewRunFormState(
     val sessionType: RunSessionType = RunSessionType.SORTIE_LONGUE,
     val thermalProfile: ThermalProfile = ThermalProfile.NEUTRE,
     val waterRefillCount: Int = 0,
-    val recentLocations: List<GeoLocationResult> = listOf(
-        GeoLocationResult("Chamonix-Mont-Blanc", "France", "Auvergne-Rhône-Alpes", 45.9237, 6.8694),
-        GeoLocationResult("Annecy", "France", "Auvergne-Rhône-Alpes", 45.8992, 6.1294),
-        GeoLocationResult("Grenoble", "France", "Auvergne-Rhône-Alpes", 45.1885, 5.7245),
-        GeoLocationResult("Lyon", "France", "Auvergne-Rhône-Alpes", 45.7640, 4.8357)
-    ),
+    val recentLocations: List<GeoLocationResult> = emptyList(),
     val bestSlots48h: List<BestWeatherSlotSuggestion> = emptyList(),
     val isLoadingWeather: Boolean = false,
     val weatherError: String? = null,
@@ -94,9 +102,10 @@ data class PastRunDraftState(
     val dateFormatted: String = "",
     val startHour: Int = 9,
     val durationMinutes: Int = 75,
-    val locationName: String = "Chamonix-Mont-Blanc",
-    val latitude: Double = 45.9237,
-    val longitude: Double = 6.8694,
+    val locationName: String = "",
+    val latitude: Double = 0.0,
+    val longitude: Double = 0.0,
+    val hasLocation: Boolean = false,
     val citySearchQuery: String = "",
     val citySearchResults: List<GeoLocationResult> = emptyList(),
     val isSearchingCity: Boolean = false,
@@ -104,17 +113,22 @@ data class PastRunDraftState(
     val sessionType: RunSessionType = RunSessionType.ENDURANCE,
     val isLoadingWeather: Boolean = false,
     val weatherStatusMessage: String? = null,
-    val weather: WeatherSlotAnalysis = OpenMeteoClient.fallbackAnalysis(
-        locationName = "Chamonix-Mont-Blanc",
-        latitude = 45.9237,
-        longitude = 6.8694,
-        startHourOfDay = 9,
-        durationMinutes = 75,
-        sessionType = RunSessionType.ENDURANCE
-    ),
-    val suggestedOutfit: String = "T-shirt manches longues respirant, Short léger"
+    /** Null tant que la vraie météo historique n'a pas été récupérée : l'enregistrement est alors bloqué. */
+    val weather: WeatherSlotAnalysis? = null,
+    val suggestedOutfit: String = ""
 )
 
+/** Prévision Open-Meteo mémorisée avec le lieu et l'heure de récupération. */
+private data class CachedForecast(
+    val response: OpenMeteoForecastResponse,
+    val latitude: Double,
+    val longitude: Double,
+    val fetchedAtMillis: Long,
+    val fetchedAtLabel: String,
+    val isFromOfflineStore: Boolean
+)
+
+@OptIn(FlowPreview::class)
 class RunCoachViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = RunCoachDatabase.getInstance(application)
@@ -124,17 +138,8 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
     private val _formState = MutableStateFlow(NewRunFormState())
     val formState: StateFlow<NewRunFormState> = _formState.asStateFlow()
 
-    private val _weatherAnalysis = MutableStateFlow(
-        OpenMeteoClient.fallbackAnalysis(
-            locationName = "Chamonix-Mont-Blanc",
-            latitude = 45.9237,
-            longitude = 6.8694,
-            startHourOfDay = 9,
-            durationMinutes = 120,
-            sessionType = RunSessionType.SORTIE_LONGUE
-        )
-    )
-    val weatherAnalysis: StateFlow<WeatherSlotAnalysis> = _weatherAnalysis.asStateFlow()
+    private val _weatherAnalysis = MutableStateFlow<WeatherSlotAnalysis?>(null)
+    val weatherAnalysis: StateFlow<WeatherSlotAnalysis?> = _weatherAnalysis.asStateFlow()
 
     private val _nutritionSettings = MutableStateFlow(loadNutritionSettings())
     val nutritionSettings: StateFlow<NutritionSettingsState> = _nutritionSettings.asStateFlow()
@@ -167,6 +172,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
     val runHistory: StateFlow<List<RunHistoryEntity>> = dao.observeRunHistory()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    /** Null tant qu'il n'y a pas de vraie météo pour le créneau : aucune recommandation sur des valeurs inventées. */
     val recommendation: StateFlow<FullRunRecommendation?> = combine(
         _formState,
         _weatherAnalysis,
@@ -176,6 +182,16 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             Quadruple(post, hist, nut, retro)
         }
     ) { form, weather, shoeList, gearList, quad ->
+        if (weather == null || !form.hasLocation) null else buildRecommendation(form, weather, shoeList, gearList, quad)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    private fun buildRecommendation(
+        form: NewRunFormState,
+        weather: WeatherSlotAnalysis,
+        shoeList: List<ShoeEntity>,
+        gearList: List<GearItemEntity>,
+        quad: Quadruple<List<ChecklistItemEntity>, List<RunHistoryEntity>, NutritionSettingsState, RetroplanningConfig>
+    ): FullRunRecommendation {
         val (postBag, historyList, nutSettings, retro) = quad
         val baseRec = RecommendationEngine.generateRecommendation(
             weather = weather,
@@ -199,7 +215,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             waterRefillCount = form.waterRefillCount
         )
 
-        val finalRec = if (form.manualShoeOverrideId != null) {
+        return if (form.manualShoeOverrideId != null) {
             val manualShoe = shoeList.find { it.id == form.manualShoeOverrideId }
             if (manualShoe != null) {
                 baseRec.copy(
@@ -208,233 +224,93 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                 )
             } else baseRec
         } else baseRec
+    }
 
-        // Synchronise le widget d'accueil avec la recommandation actuelle
-        val outfitSummary = buildString {
-            append(finalRec.outfitItems.take(2).joinToString(", "))
-            finalRec.selectedShoe?.let { append(", ${it.name}") }
-            if (finalRec.nutrition.recommendedGelsCount > 0) {
-                append(", ${finalRec.nutrition.recommendedGelsCount} gels")
-            }
-        }
-        NextRunWidgetProvider.saveAndPushWidgetUpdate(
-            context = getApplication(),
-            locationName = form.locationName,
-            terrainLabel = form.terrain.label,
-            distanceKm = form.plannedDistanceKm,
-            referenceTempC = finalRec.effectiveReferenceTempC,
-            outfitSummary = outfitSummary,
-            alertsSummary = finalRec.widgetAlertSummary
-        )
-
-        finalRec
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+    private var cachedForecast: CachedForecast? = null
+    private var weatherJob: Job? = null
+    private var pastWeatherJob: Job? = null
 
     init {
-        val savedProfileName = prefs.getString("thermal_profile", ThermalProfile.NEUTRE.name) ?: ThermalProfile.NEUTRE.name
+        val savedProfileName = prefs.getString(KEY_THERMAL_PROFILE, ThermalProfile.NEUTRE.name) ?: ThermalProfile.NEUTRE.name
         val savedProfile = runCatching { ThermalProfile.valueOf(savedProfileName) }.getOrDefault(ThermalProfile.NEUTRE)
         _formState.update { it.copy(thermalProfile = savedProfile) }
+        restoreSavedLocations()
 
         viewModelScope.launch {
-            seedInitialDataIfNeeded()
+            seedAndCleanUpData()
             refreshWeatherFromOpenMeteo()
+        }
+
+        // Widget d'accueil : mis à jour avec la recommandation, sans écrire à chaque frappe.
+        viewModelScope.launch {
+            recommendation.filterNotNull().debounce(800L).collect { pushWidgetUpdate(it) }
         }
     }
 
     private fun loadNutritionSettings(): NutritionSettingsState {
         return NutritionSettingsState(
-            carbRateMedium = prefs.getInt("carb_rate_medium", 45).coerceIn(30, 90),
-            carbRateLong = prefs.getInt("carb_rate_long", 75).coerceIn(30, 90),
-            gelCarbsGrams = prefs.getInt("gel_carbs_grams", 25).coerceIn(15, 50),
-            asphaltThresholdPercent = prefs.getInt("asphalt_threshold_pct", 60).coerceIn(20, 95)
+            carbRateMedium = prefs.getInt(KEY_CARB_MEDIUM, 45).coerceIn(30, 90),
+            carbRateLong = prefs.getInt(KEY_CARB_LONG, 75).coerceIn(30, 90),
+            gelCarbsGrams = prefs.getInt(KEY_GEL_GRAMS, 25).coerceIn(15, 50),
+            asphaltThresholdPercent = prefs.getInt(KEY_ASPHALT_PCT, 60).coerceIn(20, 95)
         )
     }
 
     private fun saveNutritionSettings(state: NutritionSettingsState) {
         prefs.edit()
-            .putInt("carb_rate_medium", state.carbRateMedium.coerceIn(30, 90))
-            .putInt("carb_rate_long", state.carbRateLong.coerceIn(30, 90))
-            .putInt("gel_carbs_grams", state.gelCarbsGrams.coerceIn(15, 50))
-            .putInt("asphalt_threshold_pct", state.asphaltThresholdPercent.coerceIn(20, 95))
+            .putInt(KEY_CARB_MEDIUM, state.carbRateMedium.coerceIn(30, 90))
+            .putInt(KEY_CARB_LONG, state.carbRateLong.coerceIn(30, 90))
+            .putInt(KEY_GEL_GRAMS, state.gelCarbsGrams.coerceIn(15, 50))
+            .putInt(KEY_ASPHALT_PCT, state.asphaltThresholdPercent.coerceIn(20, 95))
             .apply()
         _nutritionSettings.value = state
     }
 
-    private suspend fun seedInitialDataIfNeeded() = withContext(Dispatchers.IO) {
+    /**
+     * Crée le matos par défaut (non coché) et les check-lists de base.
+     * Retire une seule fois les données démo de la v1.0.1 (paires, sorties fictives, matos tout coché)
+     * si elles n'ont pas été utilisées.
+     */
+    private suspend fun seedAndCleanUpData() = withContext(Dispatchers.IO) {
         val existingCodes = dao.getAllGearOnce().map { it.code }.toSet()
         val defaultGear = listOf(
-            GearItemEntity("debardeur", "Débardeur ultra-respirant (Chaleur > 20°C)", GearCategory.HAUTS, true),
-            GearItemEntity("haut_court", "T-shirt technique manches courtes", GearCategory.HAUTS, true),
-            GearItemEntity("manchettes", "Manchettes amovibles (tenue modulable)", GearCategory.HAUTS, true),
-            GearItemEntity("haut_long", "Maillot manches longues thermique", GearCategory.HAUTS, true),
-            GearItemEntity("veste_pluie", "Veste imperméable 20 000 Schmerber", GearCategory.VESTES, true),
-            GearItemEntity("coupe_vent", "Coupe-vent léger déperlant", GearCategory.VESTES, true),
-            GearItemEntity("short", "Short de course respirant", GearCategory.BAS, true),
-            GearItemEntity("cuissard_court", "Cuissard court", GearCategory.BAS, true),
-            GearItemEntity("cuissard_long", "Collant / Cuissard long hiver", GearCategory.BAS, true),
-            GearItemEntity("chaussettes", "Chaussettes techniques Route & Trail", GearCategory.ACCESSOIRES_THERMIQUES, true),
-            GearItemEntity("gants", "Gants fins coupe-vent", GearCategory.ACCESSOIRES_THERMIQUES, true),
-            GearItemEntity("bonnet", "Bonnet / Bandeau thermique", GearCategory.ACCESSOIRES_THERMIQUES, true),
-            GearItemEntity("tour_de_cou", "Tour de cou / Buff multifonction", GearCategory.ACCESSOIRES_THERMIQUES, true),
-            GearItemEntity("guetres", "Guêtres stop-boue & débris", GearCategory.TRAIL_SPECIFIQUE, true),
-            GearItemEntity("batons_trail", "Bâtons de trail pliables", GearCategory.TRAIL_SPECIFIQUE, true),
-            GearItemEntity("frontale", "Lampe frontale rechargeable", GearCategory.TRAIL_SPECIFIQUE, true),
-            GearItemEntity("lunettes_soleil", "Lunettes de soleil photochromiques", GearCategory.SOLEIL, true),
-            GearItemEntity("casquette", "Casquette respirante anti-UV", GearCategory.SOLEIL, true),
-            GearItemEntity("creme_solaire", "Crème solaire sport SPF 50+", GearCategory.SOLEIL, true),
-            GearItemEntity("gilet_hydratation", "Gilet / Ceinture d'hydratation + flasques", GearCategory.HYDRATATION_NUTRITION, true),
-            GearItemEntity("gels", "Gels énergétiques (25 g glucides)", GearCategory.HYDRATATION_NUTRITION, true)
+            GearItemEntity("debardeur", "Débardeur ultra-respirant (Chaleur > 20°C)", GearCategory.HAUTS, false),
+            GearItemEntity("haut_court", "T-shirt technique manches courtes", GearCategory.HAUTS, false),
+            GearItemEntity("manchettes", "Manchettes amovibles (tenue modulable)", GearCategory.HAUTS, false),
+            GearItemEntity("haut_long", "Maillot manches longues thermique", GearCategory.HAUTS, false),
+            GearItemEntity("veste_pluie", "Veste imperméable", GearCategory.VESTES, false),
+            GearItemEntity("coupe_vent", "Coupe-vent léger déperlant", GearCategory.VESTES, false),
+            GearItemEntity("short", "Short de course respirant", GearCategory.BAS, false),
+            GearItemEntity("cuissard_court", "Cuissard court", GearCategory.BAS, false),
+            GearItemEntity("cuissard_long", "Collant / Cuissard long hiver", GearCategory.BAS, false),
+            GearItemEntity("chaussettes", "Chaussettes techniques Route & Trail", GearCategory.ACCESSOIRES_THERMIQUES, false),
+            GearItemEntity("gants", "Gants fins coupe-vent", GearCategory.ACCESSOIRES_THERMIQUES, false),
+            GearItemEntity("bonnet", "Bonnet / Bandeau thermique", GearCategory.ACCESSOIRES_THERMIQUES, false),
+            GearItemEntity("tour_de_cou", "Tour de cou / Buff multifonction", GearCategory.ACCESSOIRES_THERMIQUES, false),
+            GearItemEntity("guetres", "Guêtres stop-boue & débris", GearCategory.TRAIL_SPECIFIQUE, false),
+            GearItemEntity("batons_trail", "Bâtons de trail pliables", GearCategory.TRAIL_SPECIFIQUE, false),
+            GearItemEntity("frontale", "Lampe frontale rechargeable", GearCategory.TRAIL_SPECIFIQUE, false),
+            GearItemEntity("lunettes_soleil", "Lunettes de soleil", GearCategory.SOLEIL, false),
+            GearItemEntity("casquette", "Casquette respirante", GearCategory.SOLEIL, false),
+            GearItemEntity("creme_solaire", "Crème solaire", GearCategory.SOLEIL, false),
+            GearItemEntity("gilet_hydratation", "Gilet / Ceinture d'hydratation + flasques", GearCategory.HYDRATATION_NUTRITION, false),
+            GearItemEntity("gels", "Gels énergétiques", GearCategory.HYDRATATION_NUTRITION, false)
         )
         val missingGear = defaultGear.filter { it.code !in existingCodes }
         if (missingGear.isNotEmpty()) {
             dao.insertGearItems(missingGear)
         }
 
-        if (dao.getAllShoesOnce().isEmpty()) {
-            val s1 = dao.insertShoe(
-                ShoeEntity(
-                    name = "Salomon S/Lab Genesis",
-                    type = ShoeType.TRAIL_POLYVALENT,
-                    currentKm = 240.0,
-                    maxKm = 700.0
-                )
-            )
-            val s2 = dao.insertShoe(
-                ShoeEntity(
-                    name = "Salomon Speedcross 6 Mud",
-                    type = ShoeType.TRAIL_CRAMPONS,
-                    currentKm = 185.0,
-                    maxKm = 700.0
-                )
-            )
-            val s3 = dao.insertShoe(
-                ShoeEntity(
-                    name = "Hoka Speedgoat 5",
-                    type = ShoeType.TRAIL_POLYVALENT,
-                    currentKm = 648.0, // > 90 % de 700 km -> déclenche l'alerte d'usure !
-                    maxKm = 700.0
-                )
-            )
-            val s4 = dao.insertShoe(
-                ShoeEntity(
-                    name = "Nike Pegasus 41 Road",
-                    type = ShoeType.ROUTE,
-                    currentKm = 310.0,
-                    maxKm = 700.0
-                )
-            )
-
-            if (dao.getAllRunHistoryOnce().isEmpty()) {
-                val now = System.currentTimeMillis()
-                val dayMs = 24 * 3600 * 1000L
-                val sampleRuns = listOf(
-                    RunHistoryEntity(
-                        dateEpochMillis = now - 4 * dayMs,
-                        dateFormatted = formatDate(now - 4 * dayMs),
-                        locationName = "Chamonix-Mont-Blanc",
-                        sessionType = RunSessionType.SORTIE_LONGUE,
-                        terrain = TerrainType.TRAIL,
-                        plannedDistanceKm = 18.0,
-                        actualDistanceKm = 18.5,
-                        durationMinutes = 135,
-                        realTempC = 11.5,
-                        referenceTempC = 10.5,
-                        windKmh = 14.0,
-                        rainMm = 0.0,
-                        rain72hMm = 18.2,
-                        mudLevel = MudLevel.BOUEUX,
-                        maxUvIndex = 4.2,
-                        outfitWorn = "T-shirt manches longues respirant, Cuissard court, Guêtres de trail, Lunettes + Casquette",
-                        shoeId = s2,
-                        shoeName = "Salomon Speedcross 6 Mud",
-                        shoeType = ShoeType.TRAIL_CRAMPONS,
-                        gelsCarried = 4,
-                        carbRateUsed = 45,
-                        thermalFeeling = ThermalFeeling.PARFAIT,
-                        gelFeedback = GelFeedback.PILE,
-                        notes = "Sentiers gras en sous-bois, accroche crampons parfaite."
-                    ),
-                    RunHistoryEntity(
-                        dateEpochMillis = now - 11 * dayMs,
-                        dateFormatted = formatDate(now - 11 * dayMs),
-                        locationName = "Annecy",
-                        sessionType = RunSessionType.ENDURANCE,
-                        terrain = TerrainType.ROUTE,
-                        plannedDistanceKm = 12.0,
-                        actualDistanceKm = 12.2,
-                        durationMinutes = 65,
-                        realTempC = 13.0,
-                        referenceTempC = 12.0,
-                        windKmh = 12.0,
-                        rainMm = 0.0,
-                        rain72hMm = 2.0,
-                        mudLevel = MudLevel.SEC,
-                        maxUvIndex = 3.5,
-                        outfitWorn = "T-shirt manches courtes, Short léger, Lunettes + Casquette",
-                        shoeId = s4,
-                        shoeName = "Nike Pegasus 41 Road",
-                        shoeType = ShoeType.ROUTE,
-                        gelsCarried = 2,
-                        carbRateUsed = 45,
-                        thermalFeeling = ThermalFeeling.PARFAIT,
-                        gelFeedback = GelFeedback.PILE,
-                        notes = "Tour du lac fluide."
-                    ),
-                    RunHistoryEntity(
-                        dateEpochMillis = now - 25 * dayMs,
-                        dateFormatted = formatDate(now - 25 * dayMs),
-                        locationName = "Grenoble - Chartreuse",
-                        sessionType = RunSessionType.COURSE,
-                        terrain = TerrainType.TRAIL,
-                        plannedDistanceKm = 28.0,
-                        actualDistanceKm = 28.4,
-                        durationMinutes = 210,
-                        realTempC = 4.5,
-                        referenceTempC = 6.5,
-                        windKmh = 28.0,
-                        rainMm = 3.4,
-                        rain72hMm = 21.0,
-                        mudLevel = MudLevel.BOUEUX,
-                        maxUvIndex = 2.0,
-                        outfitWorn = "Maillot manches longues, Veste imperméable, Cuissard court, Gants fins, Guêtres",
-                        shoeId = s2,
-                        shoeName = "Salomon Speedcross 6 Mud",
-                        shoeType = ShoeType.TRAIL_CRAMPONS,
-                        gelsCarried = 10,
-                        carbRateUsed = 75,
-                        thermalFeeling = ThermalFeeling.TROP_FROID,
-                        gelFeedback = GelFeedback.PAS_ASSEZ,
-                        notes = "Passage de crête venté et pluvieux."
-                    ),
-                    RunHistoryEntity(
-                        dateEpochMillis = now - 48 * dayMs,
-                        dateFormatted = formatDate(now - 48 * dayMs),
-                        locationName = "Lyon - Parc de la Tête d'Or",
-                        sessionType = RunSessionType.FRACTIONNE,
-                        terrain = TerrainType.ROUTE,
-                        plannedDistanceKm = 10.0,
-                        actualDistanceKm = 10.5,
-                        durationMinutes = 55,
-                        realTempC = 19.0,
-                        referenceTempC = 22.0,
-                        windKmh = 8.0,
-                        rainMm = 0.0,
-                        rain72hMm = 0.0,
-                        mudLevel = MudLevel.SEC,
-                        maxUvIndex = 6.8,
-                        outfitWorn = "T-shirt manches courtes, Short léger, Lunettes + Casquette + Crème solaire",
-                        shoeId = s1,
-                        shoeName = "Salomon S/Lab Genesis",
-                        shoeType = ShoeType.TRAIL_POLYVALENT,
-                        gelsCarried = 0,
-                        carbRateUsed = 0,
-                        thermalFeeling = ThermalFeeling.TROP_CHAUD,
-                        gelFeedback = GelFeedback.PILE,
-                        notes = "Séance VMA au soleil."
-                    )
-                )
-                dao.insertRunHistoryList(sampleRuns)
+        if (!prefs.getBoolean(KEY_DEMO_CLEANUP_DONE, false)) {
+            val history = dao.getAllRunHistoryOnce()
+            history.filter { DemoDataCleanup.isDemoRun(it) }.forEach { dao.deleteRunHistory(it) }
+            DemoDataCleanup.unusedDemoShoes(dao.getAllShoesOnce(), history).forEach { dao.deleteShoe(it) }
+            val gear = dao.getAllGearOnce()
+            if (DemoDataCleanup.shouldUncheckDefaultGear(gear)) {
+                gear.filter { it.code in DemoDataCleanup.defaultGearCodes }
+                    .forEach { dao.upsertGearItem(it.copy(owned = false)) }
             }
+            prefs.edit().putBoolean(KEY_DEMO_CLEANUP_DONE, true).apply()
         }
 
         if (dao.getAllChecklistsOnce().isEmpty()) {
@@ -458,11 +334,83 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         return sdf.format(Date(millis))
     }
 
+    // --- Lieux mémorisés ---
+
+    private fun geoToJson(geo: GeoLocationResult): JSONObject = JSONObject().apply {
+        put("name", geo.name)
+        put("country", geo.country)
+        put("admin1", geo.admin1 ?: "")
+        put("lat", geo.latitude)
+        put("lon", geo.longitude)
+    }
+
+    private fun geoFromJson(o: JSONObject): GeoLocationResult? = try {
+        GeoLocationResult(
+            name = o.getString("name"),
+            country = o.optString("country", ""),
+            admin1 = o.optString("admin1", "").ifBlank { null },
+            latitude = o.getDouble("lat"),
+            longitude = o.getDouble("lon")
+        )
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun restoreSavedLocations() {
+        val last = prefs.getString(KEY_LAST_LOCATION, null)?.let { runCatching { geoFromJson(JSONObject(it)) }.getOrNull() }
+        val recents = prefs.getString(KEY_RECENT_LOCATIONS, null)?.let { raw ->
+            runCatching {
+                val arr = JSONArray(raw)
+                (0 until arr.length()).mapNotNull { geoFromJson(arr.getJSONObject(it)) }
+            }.getOrNull()
+        }.orEmpty()
+        _formState.update { state ->
+            if (last != null) {
+                state.copy(
+                    hasLocation = true,
+                    locationName = last.name,
+                    latitude = last.latitude,
+                    longitude = last.longitude,
+                    recentLocations = recents
+                )
+            } else {
+                state.copy(recentLocations = recents)
+            }
+        }
+    }
+
+    private fun persistLocations(last: GeoLocationResult?, recents: List<GeoLocationResult>) {
+        val editor = prefs.edit()
+        if (last != null) editor.putString(KEY_LAST_LOCATION, geoToJson(last).toString())
+        editor.putString(KEY_RECENT_LOCATIONS, JSONArray().apply { recents.forEach { put(geoToJson(it)) } }.toString())
+        editor.apply()
+    }
+
+    private fun applyLocation(geo: GeoLocationResult, addToRecents: Boolean) {
+        var newRecents: List<GeoLocationResult> = emptyList()
+        _formState.update { state ->
+            newRecents = if (addToRecents) {
+                (listOf(geo) + state.recentLocations.filterNot { it.name.equals(geo.name, ignoreCase = true) }).take(4)
+            } else {
+                state.recentLocations
+            }
+            state.copy(
+                hasLocation = true,
+                locationName = geo.name,
+                latitude = geo.latitude,
+                longitude = geo.longitude,
+                citySearchQuery = "",
+                citySearchResults = emptyList(),
+                recentLocations = newRecents
+            )
+        }
+        persistLocations(geo, newRecents)
+    }
+
     // --- Form & Open-Meteo Actions ---
 
     private fun estimateDurationForDistance(
         distanceKm: Double,
-        terrain: TerrainType = _formState.value.terrain,
         dPlusMeters: Int = _formState.value.elevationGainDPlusMeters,
         paceSecPerKm: Int = _formState.value.paceSecPerKm
     ): Int {
@@ -478,19 +426,14 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun updateTerrain(terrain: TerrainType) {
-        val defaultPaceForTerrain = if (terrain == TerrainType.TRAIL && _formState.value.paceSecPerKm == 300) 345
-        else if (terrain == TerrainType.ROUTE && _formState.value.paceSecPerKm == 345) 300
-        else _formState.value.paceSecPerKm
         val newDur = estimateDurationForDistance(
             distanceKm = _formState.value.plannedDistanceKm,
-            terrain = terrain,
             dPlusMeters = _formState.value.elevationGainDPlusMeters,
-            paceSecPerKm = defaultPaceForTerrain
+            paceSecPerKm = _formState.value.paceSecPerKm
         )
         _formState.update {
             it.copy(
                 terrain = terrain,
-                paceSecPerKm = defaultPaceForTerrain,
                 durationMinutes = newDur,
                 manualShoeOverrideId = null
             )
@@ -500,12 +443,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
 
     fun updatePlannedDistance(distanceKm: Double) {
         val safeDist = if (distanceKm.isFinite()) distanceKm.coerceIn(0.1, 200.0) else 10.0
-        val estimatedMinutes = estimateDurationForDistance(
-            distanceKm = safeDist,
-            terrain = _formState.value.terrain,
-            dPlusMeters = _formState.value.elevationGainDPlusMeters,
-            paceSecPerKm = _formState.value.paceSecPerKm
-        )
+        val estimatedMinutes = estimateDurationForDistance(distanceKm = safeDist)
         _formState.update {
             it.copy(
                 plannedDistanceKm = safeDist,
@@ -519,9 +457,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         val safeDPlus = dPlusMeters.coerceIn(0, 10000)
         val estimatedMinutes = estimateDurationForDistance(
             distanceKm = _formState.value.plannedDistanceKm,
-            terrain = _formState.value.terrain,
-            dPlusMeters = safeDPlus,
-            paceSecPerKm = _formState.value.paceSecPerKm
+            dPlusMeters = safeDPlus
         )
         _formState.update {
             it.copy(
@@ -536,8 +472,6 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         val safePace = paceSec.coerceIn(210, 540) // de 3:30/km à 9:00/km
         val estimatedMinutes = estimateDurationForDistance(
             distanceKm = _formState.value.plannedDistanceKm,
-            terrain = _formState.value.terrain,
-            dPlusMeters = _formState.value.elevationGainDPlusMeters,
             paceSecPerKm = safePace
         )
         _formState.update {
@@ -547,6 +481,24 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             )
         }
         recalculateWeatherSlot()
+    }
+
+    /** Lit le fichier GPX choisi hors du thread principal, puis l'importe. */
+    fun importGpxFromUri(uri: Uri, fileName: String) {
+        viewModelScope.launch {
+            val content = withContext(Dispatchers.IO) {
+                runCatching {
+                    getApplication<Application>().contentResolver.openInputStream(uri)
+                        ?.bufferedReader()
+                        ?.use { it.readText() }
+                }.getOrNull()
+            }
+            if (content.isNullOrBlank()) {
+                _formState.update { it.copy(statusBannerMessage = "Impossible de lire ce fichier GPX.") }
+            } else {
+                importGpxFromXmlString(content, fileName)
+            }
+        }
     }
 
     /**
@@ -562,7 +514,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             }
             if (parsed == null) {
                 _formState.update {
-                    it.copy(statusBannerMessage = "Fichier GPX invalide ou aucun point (<trkpt>) trouvé.")
+                    it.copy(statusBannerMessage = "Fichier GPX invalide : aucune trace (<trkpt> ou <rtept>) exploitable.")
                 }
                 return@launch
             }
@@ -571,21 +523,21 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             val resolvedCity = resolveCityName(context, parsed.startLat, parsed.startLon)
             val estDur = estimateDurationForDistance(
                 distanceKm = parsed.totalDistanceKm,
-                terrain = _formState.value.terrain,
                 dPlusMeters = parsed.elevationGainDPlusMeters
             )
 
+            applyLocation(
+                GeoLocationResult(resolvedCity, "", null, parsed.startLat, parsed.startLon),
+                addToRecents = false
+            )
             _formState.update {
                 it.copy(
-                    locationName = resolvedCity,
-                    latitude = parsed.startLat,
-                    longitude = parsed.startLon,
                     plannedDistanceKm = parsed.totalDistanceKm,
                     elevationGainDPlusMeters = parsed.elevationGainDPlusMeters,
                     durationMinutes = estDur,
                     gpxTrack = parsed,
                     manualShoeOverrideId = null,
-                    statusBannerMessage = "Trace « ${parsed.trackName} » importée : ${parsed.totalDistanceKm} km • ${parsed.elevationGainDPlusMeters} m D+ • Analyse Overpass…"
+                    statusBannerMessage = "Trace « ${parsed.trackName} » importée : ${parsed.totalDistanceKm} km • ${parsed.elevationGainDPlusMeters} m D+ • Analyse du revêtement…"
                 )
             }
 
@@ -593,37 +545,40 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             refreshWeatherFromOpenMeteo()
 
             // Analyse du revêtement via Overpass API (ou cache si déjà analysée)
-            val currentTerrain = _formState.value.terrain
             val breakdown = withContext(Dispatchers.IO) {
-                GpxAndOverpassAnalyzer.analyzeSurfaceWithOverpass(
-                    track = parsed,
-                    fallbackTerrain = currentTerrain
-                )
+                GpxAndOverpassAnalyzer.analyzeSurfaceWithOverpass(track = parsed)
             }
-            val updatedTrack = parsed.copy(
-                isAnalyzingSurface = false,
-                surfaceBreakdown = breakdown
-            )
-            _formState.update { state ->
-                if (state.gpxTrack?.trackIdHash == parsed.trackIdHash) {
-                    val banner = if (breakdown.isManualOrOfflineEstimate && breakdown.overpassError != null) {
-                        "Trace GPX (${parsed.totalDistanceKm} km, ${parsed.elevationGainDPlusMeters} m D+) : estimation appliquée (${breakdown.bitumePercent}% bitume, ${breakdown.cheminStabilisePercent}% stabilisé, ${breakdown.terreForetPercent}% terre)."
-                    } else if (breakdown.overpassError != null) {
-                        "Trace GPX chargée (${parsed.totalDistanceKm} km, ${parsed.elevationGainDPlusMeters} m D+). ${breakdown.overpassError}"
-                    } else if (breakdown.isUnreliable) {
-                        "Trace GPX analysée : ${breakdown.inconnuPercent}% inconnu (> 30 %) → Analyse peu fiable, règles actuelles appliquées."
-                    } else {
-                        "Revêtement GPX analysé : ${breakdown.bitumePercent}% bitume, ${breakdown.cheminStabilisePercent}% stabilisé, ${breakdown.terreForetPercent}% terre/forêt."
-                    }
-                    state.copy(gpxTrack = updatedTrack, statusBannerMessage = banner)
-                } else state
-            }
+            applySurfaceBreakdown(parsed, breakdown)
         }
+    }
+
+    private fun surfaceBanner(track: GpxTrackAnalysis, breakdown: com.example.data.model.GpxSurfaceBreakdown): String = when {
+        breakdown.overpassError != null ->
+            "Trace GPX (${track.totalDistanceKm} km, ${track.elevationGainDPlusMeters} m D+) : ${breakdown.overpassError}"
+        breakdown.isUnreliable ->
+            "Trace GPX analysée : ${breakdown.inconnuPercent}% inconnu (> 30 %) → analyse peu fiable, règles actuelles appliquées."
+        else ->
+            "Revêtement GPX analysé : ${breakdown.bitumePercent}% bitume, ${breakdown.cheminStabilisePercent}% stabilisé, ${breakdown.terreForetPercent}% terre/forêt."
+    }
+
+    private fun applySurfaceBreakdown(track: GpxTrackAnalysis, breakdown: com.example.data.model.GpxSurfaceBreakdown) {
+        val updatedTrack = track.copy(
+            isAnalyzingSurface = false,
+            surfaceBreakdown = breakdown
+        )
+        var applied = false
+        _formState.update { state ->
+            if (state.gpxTrack?.trackIdHash == track.trackIdHash) {
+                applied = true
+                state.copy(gpxTrack = updatedTrack, statusBannerMessage = surfaceBanner(track, breakdown))
+            } else state
+        }
+        // La part en forêt modifie l'effet du vent : on recalcule le créneau.
+        if (applied) recalculateWeatherSlot()
     }
 
     fun retryGpxSurfaceAnalysis() {
         val currentTrack = _formState.value.gpxTrack ?: return
-        val currentTerrain = _formState.value.terrain
         viewModelScope.launch {
             _formState.update {
                 it.copy(
@@ -634,28 +589,10 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             val breakdown = withContext(Dispatchers.IO) {
                 GpxAndOverpassAnalyzer.analyzeSurfaceWithOverpass(
                     track = currentTrack,
-                    forceRefresh = true,
-                    fallbackTerrain = currentTerrain
+                    forceRefresh = true
                 )
             }
-            val updatedTrack = currentTrack.copy(
-                isAnalyzingSurface = false,
-                surfaceBreakdown = breakdown
-            )
-            _formState.update { state ->
-                if (state.gpxTrack?.trackIdHash == currentTrack.trackIdHash) {
-                    val banner = if (breakdown.isManualOrOfflineEstimate && breakdown.overpassError != null) {
-                        "Trace GPX (${currentTrack.totalDistanceKm} km, ${currentTrack.elevationGainDPlusMeters} m D+) : estimation appliquée (${breakdown.bitumePercent}% bitume, ${breakdown.cheminStabilisePercent}% stabilisé, ${breakdown.terreForetPercent}% terre)."
-                    } else if (breakdown.overpassError != null) {
-                        "Trace GPX (${currentTrack.totalDistanceKm} km, ${currentTrack.elevationGainDPlusMeters} m D+). ${breakdown.overpassError}"
-                    } else if (breakdown.isUnreliable) {
-                        "Trace GPX analysée : ${breakdown.inconnuPercent}% inconnu (> 30 %) → Analyse peu fiable, règles actuelles appliquées."
-                    } else {
-                        "Revêtement GPX analysé : ${breakdown.bitumePercent}% bitume, ${breakdown.cheminStabilisePercent}% stabilisé, ${breakdown.terreForetPercent}% terre/forêt."
-                    }
-                    state.copy(gpxTrack = updatedTrack, statusBannerMessage = banner)
-                } else state
-            }
+            applySurfaceBreakdown(currentTrack, breakdown)
         }
     }
 
@@ -674,9 +611,10 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         _formState.update { state ->
             state.copy(
                 gpxTrack = updatedTrack,
-                statusBannerMessage = "Revêtement personnalisé : ${customBreakdown.bitumePercent}% bitume, ${customBreakdown.cheminStabilisePercent}% stabilisé, ${customBreakdown.terreForetPercent}% terre."
+                statusBannerMessage = "Revêtement saisi : ${customBreakdown.bitumePercent}% bitume, ${customBreakdown.cheminStabilisePercent}% stabilisé, ${customBreakdown.terreForetPercent}% terre."
             )
         }
+        recalculateWeatherSlot()
     }
 
     fun clearImportedGpx() {
@@ -688,6 +626,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                 statusBannerMessage = "Trace GPX retirée : retour au fonctionnement classique."
             )
         }
+        recalculateWeatherSlot()
     }
 
     fun updateDurationMinutes(minutes: Int) {
@@ -712,7 +651,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         _retroConfig.update {
             it.copy(raceStartHour = hour.coerceIn(0, 23), raceStartMinute = minute.coerceIn(0, 59))
         }
-        refreshWeatherFromOpenMeteo()
+        recalculateWeatherSlot()
     }
 
     fun selectManualShoe(shoeId: Long?) {
@@ -752,31 +691,20 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                     OpenMeteoClient.searchLocations(query)
                 }
                 _formState.update { it.copy(citySearchResults = results, isSearchingCity = false) }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 _formState.update { it.copy(isSearchingCity = false) }
             }
         }
     }
 
     fun selectGeoLocation(geo: GeoLocationResult) {
-        _formState.update { state ->
-            val updatedRecents = (listOf(geo) + state.recentLocations.filterNot {
-                it.name.equals(geo.name, ignoreCase = true)
-            }).take(4)
-            state.copy(
-                locationName = geo.name,
-                latitude = geo.latitude,
-                longitude = geo.longitude,
-                citySearchQuery = "",
-                citySearchResults = emptyList(),
-                recentLocations = updatedRecents
-            )
-        }
+        applyLocation(geo, addToRecents = true)
         refreshWeatherFromOpenMeteo()
     }
 
     fun updateThermalProfile(profile: ThermalProfile) {
-        prefs.edit().putString("thermal_profile", profile.name).apply()
+        prefs.edit().putString(KEY_THERMAL_PROFILE, profile.name).apply()
         _formState.update { it.copy(thermalProfile = profile) }
     }
 
@@ -788,7 +716,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         updateStartTime(dayOffset = slot.dayOffset, hour = slot.startHour, minute = 0)
         _formState.update {
             it.copy(
-                statusBannerMessage = "Créneau optimal appliqué : ${slot.dayLabel} à ${String.format("%02dh00", slot.startHour)} (${slot.avgTempC}°C • ${slot.weatherConditionLabel})."
+                statusBannerMessage = "Créneau appliqué : ${slot.dayLabel} à ${String.format("%02dh00", slot.startHour)} (${slot.avgTempC}°C • ${slot.weatherConditionLabel})."
             )
         }
     }
@@ -805,25 +733,17 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                 if (location != null) {
                     viewModelScope.launch {
                         val cityName = resolveCityName(context, location.latitude, location.longitude)
-                        val geo = GeoLocationResult(cityName, "", null, location.latitude, location.longitude)
-                        _formState.update { state ->
-                            val updatedRecents = (listOf(geo) + state.recentLocations.filterNot {
-                                it.name.equals(cityName, ignoreCase = true)
-                            }).take(4)
-                            state.copy(
-                                locationName = cityName,
-                                latitude = location.latitude,
-                                longitude = location.longitude,
-                                recentLocations = updatedRecents
-                            )
-                        }
+                        applyLocation(
+                            GeoLocationResult(cityName, "", null, location.latitude, location.longitude),
+                            addToRecents = true
+                        )
                         refreshWeatherFromOpenMeteo()
                     }
                 } else {
                     _formState.update {
                         it.copy(
                             isLoadingWeather = false,
-                            statusBannerMessage = "Position GPS indisponible dans l'émulateur : utilisation du lieu sélectionné (${it.locationName})."
+                            statusBannerMessage = "Position GPS indisponible : recherche une ville."
                         )
                     }
                     refreshWeatherFromOpenMeteo()
@@ -833,7 +753,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                 _formState.update {
                     it.copy(
                         isLoadingWeather = false,
-                        statusBannerMessage = "Impossible d'obtenir le signal GPS : recherche par ville disponible."
+                        statusBannerMessage = "Impossible d'obtenir le signal GPS : recherche une ville."
                     )
                 }
                 refreshWeatherFromOpenMeteo()
@@ -853,12 +773,61 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             }
         }
 
-    private var cachedForecastResponse: com.example.data.remote.OpenMeteoForecastResponse? = null
-    private var lastFetchedTimeLabel: String = ""
+    // --- Météo : réseau, cache lié au lieu et à l'heure, jamais de valeurs inventées ---
+
+    private fun currentForestShare(): Double = RecommendationEngine.forestShareOf(_formState.value.gpxTrack)
+
+    /** Analyse le créneau courant à partir d'une prévision. Renvoie faux si la prévision ne couvre pas le créneau. */
+    private fun applyForecast(cached: CachedForecast): Boolean {
+        val current = _formState.value
+        val analysis = OpenMeteoClient.analyzeSlotFromResponse(
+            response = cached.response,
+            locationName = current.locationName,
+            startHourOfDay = current.startHour,
+            dayOffsetFromToday = current.dayOffset,
+            durationMinutes = current.durationMinutes,
+            sessionType = current.sessionType,
+            startMinute = current.startMinute,
+            minTrackEleMeters = current.gpxTrack?.minElevationMeters,
+            maxTrackEleMeters = current.gpxTrack?.maxElevationMeters,
+            forestShare = currentForestShare(),
+            fetchedAtTimeLabel = cached.fetchedAtLabel,
+            isFromOfflineCache = cached.isFromOfflineStore
+        )
+        val topSlots = OpenMeteoClient.findBestWeatherSlots48h(
+            response = cached.response,
+            durationMinutes = current.durationMinutes,
+            sessionType = current.sessionType,
+            forestShare = currentForestShare()
+        )
+        _weatherAnalysis.value = analysis
+        _formState.update { it.copy(bestSlots48h = topSlots) }
+        return analysis != null
+    }
+
+    private fun loadStoredForecast(): CachedForecast? {
+        val json = prefs.getString(KEY_CACHE_JSON, null) ?: return null
+        val lat = prefs.getString(KEY_CACHE_LAT, null)?.toDoubleOrNull() ?: return null
+        val lon = prefs.getString(KEY_CACHE_LON, null)?.toDoubleOrNull() ?: return null
+        val at = prefs.getLong(KEY_CACHE_AT_MILLIS, 0L)
+        val label = prefs.getString(KEY_CACHE_LABEL, "") ?: ""
+        val resp = OpenMeteoClient.deserializeForecastFromJson(json) ?: return null
+        return CachedForecast(resp, lat, lon, at, label, isFromOfflineStore = true)
+    }
+
+    private fun CachedForecast.isUsableFor(state: NewRunFormState): Boolean =
+        state.hasLocation && WeatherCachePolicy.isUsable(latitude, longitude, fetchedAtMillis, state.latitude, state.longitude)
 
     fun refreshWeatherFromOpenMeteo() {
         val current = _formState.value
-        viewModelScope.launch {
+        if (!current.hasLocation) {
+            weatherJob?.cancel()
+            _weatherAnalysis.value = null
+            _formState.update { it.copy(isLoadingWeather = false, weatherError = null, bestSlots48h = emptyList()) }
+            return
+        }
+        weatherJob?.cancel()
+        weatherJob = viewModelScope.launch {
             _formState.update { it.copy(isLoadingWeather = true, weatherError = null) }
             try {
                 val resp = withContext(Dispatchers.IO) {
@@ -868,96 +837,57 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                         maxAttempts = 2
                     )
                 }
-                val nowTimeLabel = SimpleDateFormat("HH:mm", Locale.FRENCH).format(Date())
-                cachedForecastResponse = resp
-                lastFetchedTimeLabel = nowTimeLabel
+                val nowMillis = System.currentTimeMillis()
+                val label = SimpleDateFormat("dd/MM HH:mm", Locale.FRENCH).format(Date(nowMillis))
+                val fresh = CachedForecast(resp, current.latitude, current.longitude, nowMillis, label, isFromOfflineStore = false)
+                cachedForecast = fresh
 
-                // Sauvegarde dans le cache local hors-ligne
+                // Sauvegarde dans le cache local hors-ligne (avec le lieu et l'heure)
                 withContext(Dispatchers.IO) {
                     val json = OpenMeteoClient.serializeForecastToJson(resp)
                     if (json != null) {
                         prefs.edit()
-                            .putString("cached_weather_json", json)
-                            .putString("cached_weather_time", nowTimeLabel)
-                            .putString("cached_weather_city", current.locationName)
+                            .putString(KEY_CACHE_JSON, json)
+                            .putString(KEY_CACHE_LAT, current.latitude.toString())
+                            .putString(KEY_CACHE_LON, current.longitude.toString())
+                            .putLong(KEY_CACHE_AT_MILLIS, nowMillis)
+                            .putString(KEY_CACHE_LABEL, label)
                             .apply()
                     }
                 }
 
-                val analysis = OpenMeteoClient.analyzeSlotFromResponse(
-                    response = resp,
-                    locationName = current.locationName,
-                    startHourOfDay = current.startHour,
-                    dayOffsetFromToday = current.dayOffset,
-                    durationMinutes = current.durationMinutes,
-                    sessionType = current.sessionType,
-                    minTrackEleMeters = current.gpxTrack?.minElevationMeters,
-                    maxTrackEleMeters = current.gpxTrack?.maxElevationMeters,
-                    fetchedAtTimeLabel = nowTimeLabel,
-                    isFromOfflineCache = false
-                )
-                val topSlots = OpenMeteoClient.findBestWeatherSlots48h(
-                    response = resp,
-                    durationMinutes = current.durationMinutes,
-                    sessionType = current.sessionType
-                )
-                _weatherAnalysis.value = analysis
+                val covered = applyForecast(fresh)
                 _formState.update {
                     it.copy(
                         isLoadingWeather = false,
-                        weatherError = null,
-                        bestSlots48h = topSlots
+                        weatherError = if (covered) null else NO_SLOT_COVERAGE_MESSAGE
                     )
                 }
             } catch (e: Exception) {
-                // Tentative de restauration depuis le cache local hors-ligne avant le fallback statique
-                val cachedJson = prefs.getString("cached_weather_json", null)
-                val cachedTime = prefs.getString("cached_weather_time", "") ?: ""
-                val cachedResp = withContext(Dispatchers.Default) {
-                    OpenMeteoClient.deserializeForecastFromJson(cachedJson)
-                }
-                if (cachedResp != null) {
-                    cachedForecastResponse = cachedResp
-                    lastFetchedTimeLabel = cachedTime
-                    val offlineAnalysis = OpenMeteoClient.analyzeSlotFromResponse(
-                        response = cachedResp,
-                        locationName = current.locationName,
-                        startHourOfDay = current.startHour,
-                        dayOffsetFromToday = current.dayOffset,
-                        durationMinutes = current.durationMinutes,
-                        sessionType = current.sessionType,
-                        minTrackEleMeters = current.gpxTrack?.minElevationMeters,
-                        maxTrackEleMeters = current.gpxTrack?.maxElevationMeters,
-                        fetchedAtTimeLabel = cachedTime,
-                        isFromOfflineCache = true
-                    )
-                    val topSlots = OpenMeteoClient.findBestWeatherSlots48h(
-                        response = cachedResp,
-                        durationMinutes = current.durationMinutes,
-                        sessionType = current.sessionType
-                    )
-                    _weatherAnalysis.value = offlineAnalysis
+                if (e is CancellationException) throw e
+                val state = _formState.value
+                val usable = listOfNotNull(cachedForecast, loadStoredForecast())
+                    .filter { it.isUsableFor(state) }
+                    .maxByOrNull { it.fetchedAtMillis }
+                    ?.copy(isFromOfflineStore = true)
+                if (usable != null) {
+                    cachedForecast = usable
+                    val covered = applyForecast(usable)
                     _formState.update {
                         it.copy(
                             isLoadingWeather = false,
-                            weatherError = "Mode hors-ligne : prévisions Open-Meteo restaurées depuis le cache ($cachedTime).",
-                            bestSlots48h = topSlots
+                            weatherError = if (covered) {
+                                "Hors-ligne : prévisions Open-Meteo du ${usable.fetchedAtLabel} pour ce lieu."
+                            } else NO_SLOT_COVERAGE_MESSAGE
                         )
                     }
                 } else {
-                    val fallback = OpenMeteoClient.fallbackAnalysis(
-                        locationName = current.locationName,
-                        latitude = current.latitude,
-                        longitude = current.longitude,
-                        startHourOfDay = current.startHour,
-                        durationMinutes = current.durationMinutes,
-                        sessionType = current.sessionType
-                    )
-                    _weatherAnalysis.value = fallback
+                    _weatherAnalysis.value = null
                     _formState.update {
                         it.copy(
                             isLoadingWeather = false,
-                            weatherError = "Mode hors-ligne (Open-Meteo injoignable) : estimation locale activée."
+                            bestSlots48h = emptyList(),
+                            weatherError = "Météo indisponible : Open-Meteo injoignable et aucune prévision de moins de 12 h pour ce lieu. Pas de recommandation sans vraie météo."
                         )
                     }
                 }
@@ -965,82 +895,23 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    /** Recalcule le créneau à partir de la prévision en mémoire si elle vaut pour ce lieu, sinon recharge. */
     private fun recalculateWeatherSlot() {
-        val resp = cachedForecastResponse
+        val cached = cachedForecast
         val current = _formState.value
-        if (resp != null) {
-            _weatherAnalysis.value = OpenMeteoClient.analyzeSlotFromResponse(
-                response = resp,
-                locationName = current.locationName,
-                startHourOfDay = current.startHour,
-                dayOffsetFromToday = current.dayOffset,
-                durationMinutes = current.durationMinutes,
-                sessionType = current.sessionType,
-                minTrackEleMeters = current.gpxTrack?.minElevationMeters,
-                maxTrackEleMeters = current.gpxTrack?.maxElevationMeters,
-                fetchedAtTimeLabel = lastFetchedTimeLabel,
-                isFromOfflineCache = _weatherAnalysis.value.isFromOfflineCache
-            )
-            val topSlots = OpenMeteoClient.findBestWeatherSlots48h(
-                response = resp,
-                durationMinutes = current.durationMinutes,
-                sessionType = current.sessionType
-            )
-            _formState.update { it.copy(bestSlots48h = topSlots) }
+        if (cached != null && cached.isUsableFor(current)) {
+            val covered = applyForecast(cached)
+            _formState.update {
+                it.copy(
+                    weatherError = when {
+                        !covered -> NO_SLOT_COVERAGE_MESSAGE
+                        cached.isFromOfflineStore -> "Hors-ligne : prévisions Open-Meteo du ${cached.fetchedAtLabel} pour ce lieu."
+                        else -> null
+                    }
+                )
+            }
         } else {
-            val prev = _weatherAnalysis.value
-            val newRef = OpenMeteoClient.computeReferenceTemp(
-                realTemp = prev.realTempC,
-                windKmh = prev.maxWindKmh,
-                windGustsKmh = prev.maxWindGustsKmh,
-                slotRainMm = prev.slotRainMm,
-                humidityPercent = prev.avgHumidityPercent,
-                maxUv = prev.maxUvIndex,
-                sessionType = current.sessionType
-            )
-            _weatherAnalysis.value = prev.copy(
-                durationMinutes = current.durationMinutes,
-                referenceTempC = (newRef * 10.0).roundToInt() / 10.0
-            )
-        }
-    }
-
-    /**
-     * Permet de simuler/ajuster facilement la météo ou le cumul de pluie 72h si l'utilisateur
-     * souhaite tester différents scénarios (sec, humide, boueux, froid < 10°C, UV fort).
-     */
-    fun applyWeatherScenarioOverride(
-        realTempC: Double,
-        past72hRainMm: Double,
-        slotRainMm: Double,
-        maxUvIndex: Double,
-        windKmh: Double
-    ) {
-        val current = _formState.value
-        val ref = OpenMeteoClient.computeReferenceTemp(
-            realTemp = realTempC,
-            windKmh = windKmh,
-            slotRainMm = slotRainMm,
-            maxUv = maxUvIndex,
-            sessionType = current.sessionType
-        )
-        val simulatedRainProb = when {
-            slotRainMm >= 2.0 -> 85
-            slotRainMm >= 0.4 -> 55
-            slotRainMm > 0.0 -> 40
-            else -> 10
-        }
-        _weatherAnalysis.update {
-            it.copy(
-                realTempC = realTempC,
-                apparentTempC = realTempC - 1.0,
-                referenceTempC = (ref * 10.0).roundToInt() / 10.0,
-                past72hRainMm = past72hRainMm,
-                slotRainMm = slotRainMm,
-                maxRainProbabilityPercent = simulatedRainProb,
-                maxUvIndex = maxUvIndex,
-                maxWindKmh = windKmh
-            )
+            refreshWeatherFromOpenMeteo()
         }
     }
 
@@ -1075,7 +946,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    // --- Retroplanning & Notifications ---
+    // --- Rétroplanning (affichage seul, sans notifications) ---
 
     fun updateRetroplanningConfig(
         raceStartHour: Int = _retroConfig.value.raceStartHour,
@@ -1103,19 +974,22 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun scheduleRaceNotifications() {
-        val rec = recommendation.value ?: return
-        val count = RetroplanningNotificationReceiver.scheduleRetroplanningNotifications(
-            context = getApplication(),
-            steps = rec.retroplanningSteps,
-            dayOffsetFromToday = _formState.value.dayOffset
-        )
-        _formState.update {
-            it.copy(statusBannerMessage = "$count rappels programmés pour les étapes du rétroplanning !")
-        }
-    }
-
     // --- Retour Après Sortie (Validation, Chaussures Km + Nutrition ±5 g/h + Historique) ---
+
+    /** Date et heure de la sortie prévue (celles du créneau météo), pas celles du moment du retour. */
+    private fun plannedRunMillis(rec: FullRunRecommendation, form: NewRunFormState): Long {
+        val parsed = runCatching {
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm", Locale.US).parse(rec.weather.startDateTimeIso)?.time
+        }.getOrNull()
+        if (parsed != null) {
+            return parsed + form.startMinute * 60_000L
+        }
+        return Calendar.getInstance().apply {
+            add(Calendar.DAY_OF_YEAR, form.dayOffset)
+            set(Calendar.HOUR_OF_DAY, form.startHour)
+            set(Calendar.MINUTE, form.startMinute)
+        }.timeInMillis
+    }
 
     fun submitPostRunFeedback(
         actualDistanceKm: Double,
@@ -1124,16 +998,17 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         gelFeedback: GelFeedback,
         gelsActuallyCarried: Int,
         customOutfitText: String,
-        notes: String
+        notes: String,
+        wornShoeId: Long?
     ) {
         val rec = recommendation.value ?: return
         val form = _formState.value
         val validDistance = actualDistanceKm.coerceAtLeast(0.1)
         val validDPlus = actualDPlusMeters.coerceAtLeast(0)
+        val usedShoe = wornShoeId?.let { id -> shoes.value.find { it.id == id } }
 
         viewModelScope.launch {
-            // 1. Ajouter les km réels à la paire de chaussures utilisée
-            val usedShoe = rec.selectedShoe
+            // 1. Ajouter les km réels à la paire réellement portée
             if (usedShoe != null) {
                 dao.addKmToShoe(usedShoe.id, validDistance)
             }
@@ -1141,25 +1016,23 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             // 2. Ajuster le taux de glucides/h de ±5 g/h (borné entre 30 et 90 g/h)
             val currentNut = _nutritionSettings.value
             val delta = gelFeedback.deltaCarbPerHour
-            val updatedNut = if (form.durationMinutes > 150) {
+            val updatedNut = if (form.durationMinutes > RecommendationEngine.LONG_EFFORT_THRESHOLD_MINUTES) {
                 currentNut.copy(carbRateLong = (currentNut.carbRateLong + delta).coerceIn(30, 90))
             } else {
                 currentNut.copy(carbRateMedium = (currentNut.carbRateMedium + delta).coerceIn(30, 90))
             }
             saveNutritionSettings(updatedNut)
 
-            // 3. Enregistrer la sortie dans l'Historique
-            val cal = Calendar.getInstance().apply {
-                add(Calendar.DAY_OF_YEAR, form.dayOffset)
-            }
+            // 3. Enregistrer la sortie dans l'Historique, à la date prévue
+            val runMillis = plannedRunMillis(rec, form)
             val gpxSummaryText = form.gpxTrack?.surfaceBreakdown?.let { b ->
                 if (b.overpassError != null) "GPX (${form.gpxTrack.trackName}) : ${b.overpassError}"
                 else "GPX ${form.gpxTrack.trackName} : ${b.bitumePercent}% bitume, ${b.cheminStabilisePercent}% stabilisé, ${b.terreForetPercent}% terre/forêt, ${b.inconnuPercent}% inconnu"
             } ?: ""
 
             val entry = RunHistoryEntity(
-                dateEpochMillis = cal.timeInMillis,
-                dateFormatted = formatDate(cal.timeInMillis),
+                dateEpochMillis = runMillis,
+                dateFormatted = formatDate(runMillis),
                 locationName = form.locationName,
                 sessionType = form.sessionType,
                 terrain = form.terrain,
@@ -1191,14 +1064,14 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             dao.resetChecklist(ChecklistType.BEFORE_START)
 
             val rateMsg = if (delta != 0) {
-                val newVal = if (form.durationMinutes > 150) updatedNut.carbRateLong else updatedNut.carbRateMedium
+                val newVal = if (form.durationMinutes > RecommendationEngine.LONG_EFFORT_THRESHOLD_MINUTES) updatedNut.carbRateLong else updatedNut.carbRateMedium
                 " • Glucides ajustés à $newVal g/h"
             } else ""
             val shoeMsg = if (usedShoe != null) " • +${validDistance} km sur ${usedShoe.name}" else ""
 
             _formState.update {
                 it.copy(
-                    statusBannerMessage = "Sortie enregistrée dans l'historique$shoeMsg$rateMsg !"
+                    statusBannerMessage = "Sortie du ${entry.dateFormatted} enregistrée dans l'historique$shoeMsg$rateMsg."
                 )
             }
         }
@@ -1284,6 +1157,99 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    // --- Sauvegarde / restauration JSON ---
+
+    private val backupSettingKeys = listOf(
+        KEY_CARB_MEDIUM, KEY_CARB_LONG, KEY_GEL_GRAMS, KEY_ASPHALT_PCT,
+        KEY_THERMAL_PROFILE, KEY_LAST_LOCATION, KEY_RECENT_LOCATIONS
+    )
+
+    fun exportBackup(uri: Uri, onResult: (String) -> Unit) {
+        viewModelScope.launch {
+            val message = try {
+                val content = withContext(Dispatchers.IO) {
+                    val settings = mutableMapOf<String, Any>()
+                    val all = prefs.all
+                    backupSettingKeys.forEach { key ->
+                        when (val v = all[key]) {
+                            is Int -> settings[key] = v
+                            is String -> settings[key] = v
+                        }
+                    }
+                    BackupManager.BackupContent(
+                        shoes = dao.getAllShoesOnce(),
+                        gearItems = dao.getAllGearOnce(),
+                        checklistItems = dao.getAllChecklistsOnce(),
+                        runHistory = dao.getAllRunHistoryOnce(),
+                        settings = settings
+                    )
+                }
+                withContext(Dispatchers.IO) {
+                    val json = BackupManager.toJson(content)
+                    getApplication<Application>().contentResolver.openOutputStream(uri, "wt")?.use { out ->
+                        out.write(json.toByteArray(Charsets.UTF_8))
+                    } ?: throw IllegalStateException("Impossible d'écrire le fichier.")
+                }
+                "Sauvegarde exportée : ${content.shoes.size} paire(s), ${content.runHistory.size} sortie(s)."
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                "Échec de l'export : ${e.message ?: "erreur inconnue"}"
+            }
+            onResult(message)
+        }
+    }
+
+    fun importBackup(uri: Uri, onResult: (String) -> Unit) {
+        viewModelScope.launch {
+            val message = try {
+                val content = withContext(Dispatchers.IO) {
+                    val json = getApplication<Application>().contentResolver.openInputStream(uri)
+                        ?.bufferedReader(Charsets.UTF_8)
+                        ?.use { it.readText() }
+                        ?: throw IllegalArgumentException("Fichier illisible.")
+                    BackupManager.fromJson(json)
+                }
+                withContext(Dispatchers.IO) {
+                    db.withTransaction {
+                        dao.deleteAllRunHistory()
+                        dao.deleteAllShoes()
+                        dao.deleteAllGear()
+                        dao.deleteAllChecklists()
+                        dao.insertShoes(content.shoes)
+                        dao.insertGearItems(content.gearItems)
+                        dao.insertChecklistItems(content.checklistItems)
+                        dao.insertRunHistoryList(content.runHistory)
+                    }
+                    val editor = prefs.edit()
+                    content.settings.forEach { (key, value) ->
+                        if (key in backupSettingKeys) {
+                            when (value) {
+                                is Int -> editor.putInt(key, value)
+                                is String -> editor.putString(key, value)
+                            }
+                        }
+                    }
+                    editor.apply()
+                }
+                _nutritionSettings.value = loadNutritionSettings()
+                val profileName = prefs.getString(KEY_THERMAL_PROFILE, ThermalProfile.NEUTRE.name) ?: ThermalProfile.NEUTRE.name
+                _formState.update {
+                    it.copy(
+                        thermalProfile = runCatching { ThermalProfile.valueOf(profileName) }.getOrDefault(ThermalProfile.NEUTRE),
+                        manualShoeOverrideId = null
+                    )
+                }
+                restoreSavedLocations()
+                refreshWeatherFromOpenMeteo()
+                "Sauvegarde restaurée : ${content.shoes.size} paire(s), ${content.runHistory.size} sortie(s)."
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                "Échec de l'import : ${e.message ?: "erreur inconnue"}"
+            }
+            onResult(message)
+        }
+    }
+
     // --- Ajout d'une Sortie Passée avec Météo Historique Open-Meteo ---
 
     fun initPastRunDialog() {
@@ -1293,13 +1259,16 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             it.copy(
                 dateEpochMillis = yesterdayMillis,
                 dateFormatted = formatDate(yesterdayMillis),
-                locationName = currentForm.locationName,
+                locationName = if (currentForm.hasLocation) currentForm.locationName else "",
                 latitude = currentForm.latitude,
                 longitude = currentForm.longitude,
+                hasLocation = currentForm.hasLocation,
                 terrain = currentForm.terrain,
                 sessionType = currentForm.sessionType,
                 citySearchQuery = "",
-                citySearchResults = emptyList()
+                citySearchResults = emptyList(),
+                weather = null,
+                suggestedOutfit = ""
             )
         }
         refreshPastRunHistoricalWeather()
@@ -1339,7 +1308,8 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                     OpenMeteoClient.searchLocations(query)
                 }
                 _pastRunDraft.update { it.copy(citySearchResults = results, isSearchingCity = false) }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 _pastRunDraft.update { it.copy(isSearchingCity = false) }
             }
         }
@@ -1351,6 +1321,7 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                 locationName = geo.name,
                 latitude = geo.latitude,
                 longitude = geo.longitude,
+                hasLocation = true,
                 citySearchQuery = "",
                 citySearchResults = emptyList()
             )
@@ -1360,10 +1331,22 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
 
     fun refreshPastRunHistoricalWeather() {
         val draft = _pastRunDraft.value
-        viewModelScope.launch {
+        if (!draft.hasLocation) {
+            _pastRunDraft.update {
+                it.copy(
+                    isLoadingWeather = false,
+                    weather = null,
+                    weatherStatusMessage = "Choisis d'abord le lieu de la sortie."
+                )
+            }
+            return
+        }
+        pastWeatherJob?.cancel()
+        pastWeatherJob = viewModelScope.launch {
             _pastRunDraft.update {
                 it.copy(
                     isLoadingWeather = true,
+                    weather = null,
                     weatherStatusMessage = "Récupération de la météo du ${draft.dateFormatted} à ${draft.locationName}…"
                 )
             }
@@ -1378,6 +1361,16 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                         durationMinutes = draft.durationMinutes,
                         sessionType = draft.sessionType
                     )
+                }
+                if (weather == null) {
+                    _pastRunDraft.update {
+                        it.copy(
+                            isLoadingWeather = false,
+                            weather = null,
+                            weatherStatusMessage = "Pas de données météo pour ce créneau : impossible d'enregistrer avec une météo fiable."
+                        )
+                    }
+                    return@launch
                 }
                 val ownedSet = gearItems.value.filter { it.owned }.map { it.code }.toSet()
                 val mudAlert = RecommendationEngine.computeMudAlert(draft.terrain, weather.past72hRainMm, ownedSet)
@@ -1408,20 +1401,13 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                         weatherStatusMessage = "Météo historique Open-Meteo récupérée (${draft.dateFormatted} • ${draft.startHour}h00)"
                     )
                 }
-            } catch (_: Exception) {
-                val fallback = OpenMeteoClient.fallbackAnalysis(
-                    locationName = draft.locationName,
-                    latitude = draft.latitude,
-                    longitude = draft.longitude,
-                    startHourOfDay = draft.startHour,
-                    durationMinutes = draft.durationMinutes,
-                    sessionType = draft.sessionType
-                )
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 _pastRunDraft.update {
                     it.copy(
                         isLoadingWeather = false,
-                        weather = fallback,
-                        weatherStatusMessage = "Open-Meteo archive hors-ligne : valeurs météo estimées."
+                        weather = null,
+                        weatherStatusMessage = "Météo historique indisponible (réseau ?) : réessaie, l'enregistrement attend une vraie météo."
                     )
                 }
             }
@@ -1441,8 +1427,15 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
         notes: String
     ) {
         val draft = _pastRunDraft.value
+        val weather = draft.weather
+        if (weather == null) {
+            _formState.update {
+                it.copy(statusBannerMessage = "Sortie non enregistrée : météo historique indisponible.")
+            }
+            return
+        }
         val validDist = distanceKm.coerceAtLeast(0.1)
-        val selectedShoe = shoes.value.find { it.id == shoeId } ?: shoes.value.firstOrNull()
+        val selectedShoe = shoeId?.let { id -> shoes.value.find { it.id == id } }
 
         viewModelScope.launch {
             if (addKmToShoe && selectedShoe != null) {
@@ -1450,10 +1443,11 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             }
 
             val currentNut = _nutritionSettings.value
-            val activeRate = if (draft.durationMinutes > 150) currentNut.carbRateLong else currentNut.carbRateMedium
+            val isLong = draft.durationMinutes > RecommendationEngine.LONG_EFFORT_THRESHOLD_MINUTES
+            val activeRate = if (isLong) currentNut.carbRateLong else currentNut.carbRateMedium
             if (adjustCarbRate && gelFeedback.deltaCarbPerHour != 0) {
                 val delta = gelFeedback.deltaCarbPerHour
-                val updatedNut = if (draft.durationMinutes > 150) {
+                val updatedNut = if (isLong) {
                     currentNut.copy(carbRateLong = (currentNut.carbRateLong + delta).coerceIn(30, 90))
                 } else {
                     currentNut.copy(carbRateMedium = (currentNut.carbRateMedium + delta).coerceIn(30, 90))
@@ -1464,13 +1458,19 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
             val ownedSet = gearItems.value.filter { it.owned }.map { it.code }.toSet()
             val mudAlert = RecommendationEngine.computeMudAlert(
                 terrain = draft.terrain,
-                rain72hMm = draft.weather.past72hRainMm,
+                rain72hMm = weather.past72hRainMm,
                 ownedGearCodes = ownedSet
             )
 
+            val runMillis = Calendar.getInstance().apply {
+                timeInMillis = draft.dateEpochMillis
+                set(Calendar.HOUR_OF_DAY, draft.startHour)
+                set(Calendar.MINUTE, 0)
+            }.timeInMillis
+
             val entry = RunHistoryEntity(
-                dateEpochMillis = draft.dateEpochMillis,
-                dateFormatted = draft.dateFormatted.ifBlank { formatDate(draft.dateEpochMillis) },
+                dateEpochMillis = runMillis,
+                dateFormatted = draft.dateFormatted.ifBlank { formatDate(runMillis) },
                 locationName = draft.locationName,
                 sessionType = draft.sessionType,
                 terrain = draft.terrain,
@@ -1479,13 +1479,13 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
                 elevationGainDPlusMeters = dPlusMeters.coerceAtLeast(0),
                 gpxSurfaceSummary = "",
                 durationMinutes = draft.durationMinutes,
-                realTempC = draft.weather.realTempC,
-                referenceTempC = draft.weather.referenceTempC,
-                windKmh = draft.weather.maxWindKmh,
-                rainMm = draft.weather.slotRainMm,
-                rain72hMm = draft.weather.past72hRainMm,
+                realTempC = weather.realTempC,
+                referenceTempC = weather.referenceTempC,
+                windKmh = weather.maxWindKmh,
+                rainMm = weather.slotRainMm,
+                rain72hMm = weather.past72hRainMm,
                 mudLevel = mudAlert.mudLevel,
-                maxUvIndex = draft.weather.maxUvIndex,
+                maxUvIndex = weather.maxUvIndex,
                 outfitWorn = outfitWorn.ifBlank { draft.suggestedOutfit },
                 shoeId = selectedShoe?.id,
                 shoeName = selectedShoe?.name ?: "Non renseignée",
@@ -1500,10 +1500,51 @@ class RunCoachViewModel(application: Application) : AndroidViewModel(application
 
             _formState.update {
                 it.copy(
-                    statusBannerMessage = "Sortie passée du ${entry.dateFormatted} à ${entry.locationName} enregistrée dans l'historique !"
+                    statusBannerMessage = "Sortie passée du ${entry.dateFormatted} à ${entry.locationName} enregistrée dans l'historique."
                 )
             }
         }
+    }
+
+    // --- Widget ---
+
+    private fun pushWidgetUpdate(rec: FullRunRecommendation) {
+        val form = _formState.value
+        val outfitSummary = buildString {
+            append(rec.outfitItems.take(2).joinToString(", "))
+            rec.selectedShoe?.let { append(", ${it.name}") }
+            if (rec.nutrition.recommendedGelsCount > 0) {
+                append(", ${rec.nutrition.recommendedGelsCount} gels")
+            }
+        }
+        NextRunWidgetProvider.saveAndPushWidgetUpdate(
+            context = getApplication(),
+            locationName = form.locationName,
+            terrainLabel = form.terrain.label,
+            distanceKm = form.plannedDistanceKm,
+            referenceTempC = rec.effectiveReferenceTempC,
+            outfitSummary = outfitSummary,
+            alertsSummary = rec.widgetAlertSummary
+        )
+    }
+
+    companion object {
+        private const val KEY_THERMAL_PROFILE = "thermal_profile"
+        private const val KEY_CARB_MEDIUM = "carb_rate_medium"
+        private const val KEY_CARB_LONG = "carb_rate_long"
+        private const val KEY_GEL_GRAMS = "gel_carbs_grams"
+        private const val KEY_ASPHALT_PCT = "asphalt_threshold_pct"
+        private const val KEY_LAST_LOCATION = "last_location_json"
+        private const val KEY_RECENT_LOCATIONS = "recent_locations_json"
+        private const val KEY_CACHE_JSON = "cached_weather_json"
+        private const val KEY_CACHE_LAT = "cached_weather_lat"
+        private const val KEY_CACHE_LON = "cached_weather_lon"
+        private const val KEY_CACHE_AT_MILLIS = "cached_weather_at_millis"
+        private const val KEY_CACHE_LABEL = "cached_weather_label"
+        private const val KEY_DEMO_CLEANUP_DONE = "demo_cleanup_v1_done"
+
+        private const val NO_SLOT_COVERAGE_MESSAGE =
+            "La prévision ne couvre pas ce créneau (trop loin ou déjà passé) : pas de recommandation."
     }
 }
 

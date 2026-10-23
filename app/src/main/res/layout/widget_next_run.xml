@@ -34,7 +34,7 @@
                 android:layout_height="wrap_content"
                 android:ellipsize="end"
                 android:maxLines="1"
-                android:text="Chamonix • Trail 18 km"
+                android:text="Ouvre l'appli pour préparer ta sortie"
                 android:textColor="#F8FAFC"
                 android:textSize="15sp"
                 android:textStyle="bold" />
@@ -49,7 +49,7 @@
             android:paddingTop="4dp"
             android:paddingRight="10dp"
             android:paddingBottom="4dp"
-            android:text="Réf 11°C"
+            android:text="Réf —"
             android:textColor="#FFFFFF"
             android:textSize="14sp"
             android:textStyle="bold" />
@@ -62,7 +62,7 @@
         android:layout_marginTop="6dp"
         android:ellipsize="end"
         android:maxLines="2"
-        android:text="Tenue : T-shirt manches courtes, Short, Chaussures Trail crampons, 2 gels"
+        android:text="Tenue : —"
         android:textColor="#CBD5E1"
         android:textSize="12sp" />
 
@@ -73,7 +73,7 @@
         android:layout_marginTop="6dp"
         android:ellipsize="end"
         android:maxLines="1"
-        android:text="Alertes : Terrain boueux (18 mm/72h) • UV 5 (Lunettes + Casquette)"
+        android:text="Alertes : —"
         android:textColor="#FBBF24"
         android:textSize="11sp"
         android:textStyle="bold" />

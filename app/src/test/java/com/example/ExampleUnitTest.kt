@@ -47,9 +47,10 @@ class ExampleUnitTest {
         val low = RecommendationEngine.computeUvAlert(2.0)
         assertEquals(false, low.needsGlassesAndCap)
 
+        // Seuil OMS : protection complète (dont crème solaire) dès UV 3
         val med = RecommendationEngine.computeUvAlert(3.5)
         assertEquals(true, med.needsGlassesAndCap)
-        assertEquals(false, med.needsSunscreen)
+        assertEquals(true, med.needsSunscreen)
 
         val high = RecommendationEngine.computeUvAlert(6.2)
         assertEquals(true, high.needsGlassesAndCap)

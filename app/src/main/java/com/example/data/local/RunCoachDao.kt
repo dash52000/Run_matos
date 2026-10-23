@@ -34,6 +34,21 @@ interface RunCoachDao {
     @Query("UPDATE shoes SET currentKm = currentKm + :addedKm WHERE id = :shoeId")
     suspend fun addKmToShoe(shoeId: Long, addedKm: Double)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertShoes(shoes: List<ShoeEntity>)
+
+    @Query("DELETE FROM shoes")
+    suspend fun deleteAllShoes()
+
+    @Query("DELETE FROM gear_items")
+    suspend fun deleteAllGear()
+
+    @Query("DELETE FROM checklist_items")
+    suspend fun deleteAllChecklists()
+
+    @Query("DELETE FROM run_history")
+    suspend fun deleteAllRunHistory()
+
     // Gear Items
     @Query("SELECT * FROM gear_items ORDER BY category ASC, name ASC")
     fun observeGearItems(): Flow<List<GearItemEntity>>

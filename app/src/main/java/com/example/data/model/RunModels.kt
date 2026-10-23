@@ -175,7 +175,9 @@ data class WeatherSlotAnalysis(
     val summitElevationMeters: Int? = null,
     val fetchedAtTimeLabel: String = "",
     val isFromOfflineCache: Boolean = false,
-    val isNightOrDawn: Boolean
+    val isNightOrDawn: Boolean,
+    val sunriseLabel: String? = null,
+    val sunsetLabel: String? = null
 ) {
     val needsJacketJustInCase: Boolean
         get() = slotRainMm < 1.0 && (maxRainProbabilityPercent >= 40 || maxWindGustsKmh >= 35.0)

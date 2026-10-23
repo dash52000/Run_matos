@@ -37,7 +37,6 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Thermostat
-import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material.icons.filled.WaterDrop
 import androidx.compose.material.icons.filled.WbSunny
@@ -59,9 +58,11 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -107,7 +108,7 @@ fun NewRunAndRecommendationScreen(
     onPlannedDistanceChange: (Double) -> Unit,
     onElevationGainChange: (Int) -> Unit = {},
     onPaceChange: (Int) -> Unit = {},
-    onImportGpxXml: (String, String) -> Unit = { _, _ -> },
+    onImportGpxUri: (android.net.Uri, String) -> Unit = { _, _ -> },
     onRetryOverpassAnalysis: () -> Unit = {},
     onApplyCustomSurfaceBreakdown: (Double, Double, Double) -> Unit = { _, _, _ -> },
     onClearGpx: () -> Unit = {},
@@ -121,21 +122,17 @@ fun NewRunAndRecommendationScreen(
     onStartNewRunReset: () -> Unit,
     onClearBanner: () -> Unit,
     onSelectManualShoe: (Long?) -> Unit,
-    onApplyWeatherScenario: (Double, Double, Double, Double, Double) -> Unit,
     onToggleChecklist: (ChecklistItemEntity) -> Unit,
     onAddChecklist: (ChecklistType, String) -> Unit,
     onDeleteChecklist: (ChecklistItemEntity) -> Unit,
     onResetBeforeChecklist: () -> Unit,
     onUpdateRetroConfig: (Int, Int, Int, Int, Int, Int) -> Unit,
-    onScheduleRetroNotifications: () -> Unit,
     onThermalProfileChange: (ThermalProfile) -> Unit = {},
     onWaterRefillCountChange: (Int) -> Unit = {},
     onApplyBestWeatherSlot: (BestWeatherSlotSuggestion) -> Unit = {},
-    onSubmitPostRun: (Double, Int, ThermalFeeling, GelFeedback, Int, String, String) -> Unit
+    onSubmitPostRun: (Double, Int, ThermalFeeling, GelFeedback, Int, String, String, Long?) -> Unit
 ) {
-    val context = androidx.compose.ui.platform.LocalContext.current
     var showPostRunDialog by remember { mutableStateOf(false) }
-    var showWeatherSimulator by remember { mutableStateOf(false) }
     var showBestSlots48h by remember { mutableStateOf(false) }
     var showTimePickerDialog by remember { mutableStateOf(false) }
     var distanceInputText by remember(formState.plannedDistanceKm) {
@@ -152,14 +149,8 @@ fun NewRunAndRecommendationScreen(
         contract = ActivityResultContracts.GetContent()
     ) { uri ->
         if (uri != null) {
-            try {
-                val content = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                if (!content.isNullOrBlank()) {
-                    val fileName = uri.lastPathSegment?.substringAfterLast('/') ?: "Trace GPX"
-                    onImportGpxXml(content, fileName)
-                }
-            } catch (_: Exception) {
-            }
+            val fileName = uri.lastPathSegment?.substringAfterLast('/') ?: "Trace GPX"
+            onImportGpxUri(uri, fileName)
         }
     }
 
@@ -170,6 +161,20 @@ fun NewRunAndRecommendationScreen(
             permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
         if (granted) {
             onDetectGps()
+        }
+    }
+
+    // Premier lancement sans lieu mémorisé : on propose la localisation GPS une fois.
+    var askedLocationOnce by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(formState.hasLocation) {
+        if (!formState.hasLocation && !askedLocationOnce) {
+            askedLocationOnce = true
+            locationPermissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+            )
         }
     }
 
@@ -322,16 +327,6 @@ fun NewRunAndRecommendationScreen(
                                     tint = MaterialTheme.colorScheme.primary
                                 )
                             }
-                            IconButton(
-                                onClick = { showWeatherSimulator = !showWeatherSimulator },
-                                modifier = Modifier.testTag("toggle_weather_simulator_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Tune,
-                                    contentDescription = "Tester un scénario météo/boue",
-                                    tint = MaterialTheme.colorScheme.secondary
-                                )
-                            }
                         }
                     }
 
@@ -339,18 +334,6 @@ fun NewRunAndRecommendationScreen(
                     GpxImportBarSection(
                         gpxTrack = formState.gpxTrack,
                         onPickGpxFileClick = { gpxFileLauncher.launch("*/*") },
-                        onLoadSampleTrailGpx = {
-                            onImportGpxXml(
-                                com.example.data.remote.GpxAndOverpassAnalyzer.getSampleTrailGpxXml(),
-                                "Boucle Petit Balcon Chamonix.gpx"
-                            )
-                        },
-                        onLoadSampleRoadGpx = {
-                            onImportGpxXml(
-                                com.example.data.remote.GpxAndOverpassAnalyzer.getSampleRoadDominantGpxXml(),
-                                "Berges Annecy Mixte.gpx"
-                            )
-                        },
                         onClearGpx = onClearGpx
                     )
 
@@ -732,17 +715,48 @@ fun NewRunAndRecommendationScreen(
                         }
                     }
 
-                    // Simulateur rapide pour tester les seuils (Boue <5 / 5-15 / >15mm, UV ≥3 / ≥6, Froid <10°C)
-                    AnimatedVisibility(visible = showWeatherSimulator && recommendation != null) {
-                        recommendation?.let { rec ->
-                            WeatherScenarioTester(
-                                currentTemp = rec.weather.realTempC,
-                                currentRain72h = rec.weather.past72hRainMm,
-                                currentSlotRain = rec.weather.slotRainMm,
-                                currentUv = rec.weather.maxUvIndex,
-                                currentWind = rec.weather.maxWindKmh,
-                                onApply = onApplyWeatherScenario
-                            )
+                }
+            }
+        }
+
+        // Statut météo : pas de lieu, météo indisponible ou mode hors-ligne
+        val weatherStatusText = when {
+            !formState.hasLocation ->
+                "Aucun lieu choisi : recherche une ville ou utilise le GPS pour obtenir la météo et la recommandation."
+            formState.weatherError != null -> formState.weatherError
+            recommendation == null && formState.isLoadingWeather -> "Chargement de la météo Open-Meteo…"
+            else -> null
+        }
+        if (weatherStatusText != null) {
+            item {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = if (recommendation == null) MudAmber.copy(alpha = 0.18f) else MaterialTheme.colorScheme.tertiaryContainer,
+                    modifier = Modifier
+                        .padding(horizontal = 16.dp)
+                        .fillMaxWidth()
+                        .testTag("weather_status_banner")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.WarningAmber,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = weatherStatusText,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (formState.hasLocation && !formState.isLoadingWeather) {
+                            OutlinedButton(onClick = onRefreshWeather) {
+                                Text("Réessayer", maxLines = 1, softWrap = false)
+                            }
                         }
                     }
                 }
@@ -856,8 +870,7 @@ fun NewRunAndRecommendationScreen(
                         RetroplanningCard(
                             config = retroConfig,
                             steps = recommendation.retroplanningSteps,
-                            onUpdateConfig = onUpdateRetroConfig,
-                            onScheduleNotifications = onScheduleRetroNotifications
+                            onUpdateConfig = onUpdateRetroConfig
                         )
                     }
                 }
@@ -900,61 +913,13 @@ fun NewRunAndRecommendationScreen(
     if (showPostRunDialog && recommendation != null) {
         PostRunFeedbackDialog(
             recommendation = recommendation,
+            shoes = shoes,
             onDismiss = { showPostRunDialog = false },
-            onConfirm = { actualKm, actualDPlus, feeling, gelFb, gelsCount, outfitTxt, notes ->
-                onSubmitPostRun(actualKm, actualDPlus, feeling, gelFb, gelsCount, outfitTxt, notes)
+            onConfirm = { actualKm, actualDPlus, feeling, gelFb, gelsCount, outfitTxt, notes, shoeId ->
+                onSubmitPostRun(actualKm, actualDPlus, feeling, gelFb, gelsCount, outfitTxt, notes, shoeId)
                 showPostRunDialog = false
             }
         )
-    }
-}
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-private fun WeatherScenarioTester(
-    currentTemp: Double,
-    currentRain72h: Double,
-    currentSlotRain: Double,
-    currentUv: Double,
-    currentWind: Double,
-    onApply: (Double, Double, Double, Double, Double) -> Unit
-) {
-    Surface(
-        shape = RoundedCornerShape(14.dp),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Text(
-                text = "Simulateur rapide de conditions (test des règles)",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.Bold
-            )
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                AssistChip(
-                    onClick = { onApply(14.0, 2.0, 0.0, 4.0, 10.0) },
-                    label = { Text("Trail Sec (<5mm) + UV 4") }
-                )
-                AssistChip(
-                    onClick = { onApply(11.0, 9.5, 0.5, 2.0, 15.0) },
-                    label = { Text("Trail Humide (5-15mm)") }
-                )
-                AssistChip(
-                    onClick = { onApply(8.0, 22.0, 2.5, 1.5, 25.0) },
-                    label = { Text("Trail Boueux (>15mm) + <10°C") }
-                )
-                AssistChip(
-                    onClick = { onApply(23.0, 0.0, 0.0, 7.5, 8.0) },
-                    label = { Text("Grand Soleil (UV 7.5 ≥ 6)") }
-                )
-            }
-        }
     }
 }
 
@@ -992,12 +957,15 @@ private fun WeatherAndAlertsSection(recommendation: FullRunRecommendation) {
                             fontWeight = FontWeight.Bold
                         )
                         val freshnessNote = when {
-                            w.isFromOfflineCache && w.fetchedAtTimeLabel.isNotBlank() -> " • Cache (${w.fetchedAtTimeLabel})"
+                            w.isFromOfflineCache && w.fetchedAtTimeLabel.isNotBlank() -> " • Cache du ${w.fetchedAtTimeLabel}"
                             w.fetchedAtTimeLabel.isNotBlank() -> " • Relevé ${w.fetchedAtTimeLabel}"
                             else -> ""
                         }
+                        val sunNote = if (w.sunriseLabel != null && w.sunsetLabel != null) {
+                            " • Soleil ${w.sunriseLabel} – ${w.sunsetLabel}${if (w.isNightOrDawn) " (frontale)" else ""}"
+                        } else ""
                         Text(
-                            text = "Cumul 72h : ${w.past72hRainMm} mm • Humidité : ${w.avgHumidityPercent} %$freshnessNote",
+                            text = "Cumul 72h : ${w.past72hRainMm} mm • Humidité : ${w.avgHumidityPercent} %$freshnessNote$sunNote",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

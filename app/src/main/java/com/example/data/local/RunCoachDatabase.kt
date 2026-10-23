@@ -65,7 +65,10 @@ abstract class RunCoachDatabase : RoomDatabase() {
                     context.applicationContext,
                     RunCoachDatabase::class.java,
                     "runcoach_matos.db"
-                ).fallbackToDestructiveMigration(true).build()
+                ).build()
+                // Pas de fallbackToDestructiveMigration : un changement de schéma sans migration
+                // doit échouer bruyamment plutôt qu'effacer chaussures et historique.
+                // Toute évolution du schéma doit fournir une Migration explicite (addMigrations).
                 INSTANCE = instance
                 instance
             }

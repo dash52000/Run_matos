@@ -1,5 +1,9 @@
 package com.example.ui.screens
 
+import android.net.Uri
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -24,6 +28,7 @@ import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Checkroom
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.AlertDialog
@@ -52,6 +57,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -62,6 +68,9 @@ import com.example.data.model.GearCategory
 import com.example.data.model.ShoeType
 import com.example.ui.NutritionSettingsState
 import com.example.ui.theme.AlertRed
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -74,8 +83,20 @@ fun GearAndShoesScreen(
     onDeleteShoe: (ShoeEntity) -> Unit,
     onToggleGearOwned: (GearItemEntity) -> Unit,
     onAddCustomGear: (String, GearCategory) -> Unit,
-    onUpdateNutritionSettings: (Int, Int, Int, Int) -> Unit
+    onUpdateNutritionSettings: (Int, Int, Int, Int) -> Unit,
+    onExportBackup: (Uri, (String) -> Unit) -> Unit = { _, _ -> },
+    onImportBackup: (Uri, (String) -> Unit) -> Unit = { _, _ -> }
 ) {
+    val context = LocalContext.current
+    val showResult: (String) -> Unit = { msg -> Toast.makeText(context, msg, Toast.LENGTH_LONG).show() }
+    var pendingImportUri by remember { mutableStateOf<Uri?>(null) }
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri -> if (uri != null) onExportBackup(uri, showResult) }
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri -> if (uri != null) pendingImportUri = uri }
+
     var editingShoe by remember { mutableStateOf<ShoeEntity?>(null) }
     var showAddShoeDialog by remember { mutableStateOf(false) }
     var showAddGearDialog by remember { mutableStateOf(false) }
@@ -99,7 +120,7 @@ fun GearAndShoesScreen(
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "Gérez vos paires de chaussures (suivi d'usure sur 700 km par défaut), votre garde-robe technique et vos cibles glucidiques.",
+                    text = "Gérez vos paires de chaussures (suivi d'usure sur 700 km par défaut), votre garde-robe technique et vos cibles glucidiques. Coche le matos que tu possèdes : les conseils de tenue en tiennent compte.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -296,6 +317,93 @@ fun GearAndShoesScreen(
                 }
             }
         }
+
+        // Section 4 : SAUVEGARDE (export / import JSON)
+        item {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("backup_card"),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Save,
+                            contentDescription = "Sauvegarde",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = "Sauvegarde de mes données",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                    Text(
+                        text = "Exporte chaussures, matos, check-lists, historique et réglages dans un fichier JSON (à garder sur ton Drive par exemple), pour les restaurer après une réinstallation.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                val stamp = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+                                exportLauncher.launch("run-matos-sauvegarde-$stamp.json")
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("export_backup_button")
+                        ) {
+                            Text("Exporter", maxLines = 1, softWrap = false)
+                        }
+                        OutlinedButton(
+                            onClick = { importLauncher.launch(arrayOf("application/json", "text/plain", "*/*")) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("import_backup_button")
+                        ) {
+                            Text("Importer", maxLines = 1, softWrap = false)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pendingImportUri?.let { uri ->
+        AlertDialog(
+            onDismissRequest = { pendingImportUri = null },
+            title = { Text("Restaurer cette sauvegarde ?") },
+            text = {
+                Text("Les chaussures, le matos, les check-lists, l'historique et les réglages actuels seront remplacés par ceux du fichier.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onImportBackup(uri, showResult)
+                        pendingImportUri = null
+                    }
+                ) {
+                    Text("Remplacer")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingImportUri = null }) {
+                    Text("Annuler")
+                }
+            }
+        )
     }
 
     if (showAddShoeDialog) {

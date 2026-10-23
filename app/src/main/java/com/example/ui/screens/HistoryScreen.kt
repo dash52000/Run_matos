@@ -320,7 +320,7 @@ private fun AddPastRunDialog(
     var showDatePicker by remember { mutableStateOf(false) }
     var distanceText by remember { mutableStateOf("12.0") }
     var dPlusText by remember { mutableStateOf("200") }
-    var selectedShoeId by remember(shoes) { mutableStateOf(shoes.firstOrNull()?.id) }
+    var selectedShoeId by remember { mutableStateOf<Long?>(null) }
     var addKmToShoe by remember { mutableStateOf(true) }
     var outfitText by remember { mutableStateOf(draft.suggestedOutfit) }
     var outfitEditedManually by remember { mutableStateOf(false) }
@@ -337,10 +337,13 @@ private fun AddPastRunDialog(
         }
     }
 
-    val mudLevel = when {
-        draft.weather.past72hRainMm < 5.0 -> MudLevel.SEC
-        draft.weather.past72hRainMm <= 15.0 -> MudLevel.HUMIDE
-        else -> MudLevel.BOUEUX
+    val pastWeather = draft.weather
+    val mudLevel = pastWeather?.let {
+        when {
+            it.past72hRainMm < 5.0 -> MudLevel.SEC
+            it.past72hRainMm <= 15.0 -> MudLevel.HUMIDE
+            else -> MudLevel.BOUEUX
+        }
     }
 
     AlertDialog(
@@ -454,7 +457,7 @@ private fun AddPastRunDialog(
                 }
 
                 // 2. Lieu de la sortie passée
-                Text("2. Lieu (${draft.locationName})", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+                Text("2. Lieu (${draft.locationName.ifBlank { "à choisir" }})", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
                 OutlinedTextField(
                     value = draft.citySearchQuery,
                     onValueChange = onSearchCityChange,
@@ -514,17 +517,26 @@ private fun AddPastRunDialog(
                             color = MaterialTheme.colorScheme.onSecondaryContainer,
                             fontWeight = FontWeight.Bold
                         )
-                        Text(
-                            text = "Réf ${draft.weather.referenceTempC}°C (réelle ${draft.weather.realTempC}°C) • Vent ${draft.weather.maxWindKmh.roundToInt()} km/h • Pluie créneau ${draft.weather.slotRainMm} mm • UV ${draft.weather.maxUvIndex}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSecondaryContainer
-                        )
-                        Text(
-                            text = "Pluie 72 h avant sortie : ${draft.weather.past72hRainMm} mm → État terrain : ${mudLevel.label}",
-                            style = MaterialTheme.typography.bodySmall,
-                            fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.primary
-                        )
+                        if (pastWeather != null && mudLevel != null) {
+                            Text(
+                                text = "Réf ${pastWeather.referenceTempC}°C (réelle ${pastWeather.realTempC}°C) • Vent ${pastWeather.maxWindKmh.roundToInt()} km/h • Pluie créneau ${pastWeather.slotRainMm} mm • UV ${pastWeather.maxUvIndex}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                            Text(
+                                text = "Pluie 72 h avant sortie : ${pastWeather.past72hRainMm} mm → État terrain : ${mudLevel.label}",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        } else if (!draft.isLoadingWeather) {
+                            Text(
+                                text = "Pas de météo fiable pour l'instant : l'enregistrement est bloqué tant qu'elle n'est pas récupérée.",
+                                style = MaterialTheme.typography.bodySmall,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
                     }
                 }
 
@@ -597,6 +609,11 @@ private fun AddPastRunDialog(
                                 label = { Text("${shoe.name} (${shoe.currentKm.roundToInt()} km)") }
                             )
                         }
+                        FilterChip(
+                            selected = selectedShoeId == null,
+                            onClick = { selectedShoeId = null },
+                            label = { Text("Non renseignée") }
+                        )
                     }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(
@@ -706,6 +723,7 @@ private fun AddPastRunDialog(
                         notesText
                     )
                 },
+                enabled = draft.weather != null && !draft.isLoadingWeather,
                 modifier = Modifier.testTag("save_past_run_confirm_button")
             ) {
                 Text("Enregistrer la sortie")

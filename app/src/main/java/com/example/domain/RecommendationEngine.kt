@@ -102,7 +102,8 @@ object RecommendationEngine {
      * Choix automatique de la paire de chaussures :
      * - Sans trace GPX : type adapté au terrain et à l'état de boue, puis la paire la moins usée.
      * - Avec trace GPX :
-     *   - Si part « inconnu » > 30 % : « analyse peu fiable » et règles actuelles.
+     *   - Répartition saisie à la main : utilisée telle quelle.
+     *   - Si OSM n'a rien donné ou si la part « inconnu » > 30 % : règles actuelles.
      *   - Si terrain sec (alerte boue = sec) ET bitume >= seuil (60 % par défaut) : chaussures de route.
      *   - Dans tous les autres cas : règles actuelles (trail polyvalent ou crampons selon l'état de boue).
      */
@@ -126,9 +127,9 @@ object RecommendationEngine {
                 breakdown.isManualOrOfflineEstimate -> {
                     if (mudLevel == MudLevel.SEC && breakdown.bitumePercent >= asphaltThresholdPercent.toDouble()) {
                         forceRouteShoesFromGpx = true
-                        gpxPrefixNote = "Trace GPX (revêtement estimé : ${breakdown.bitumePercent}% bitume ≥ $asphaltThresholdPercent%) → Route privilégiée • "
+                        gpxPrefixNote = "Trace GPX (revêtement saisi : ${breakdown.bitumePercent}% bitume ≥ $asphaltThresholdPercent%) → Route privilégiée • "
                     } else {
-                        gpxPrefixNote = "Trace GPX (revêtement estimé : ${breakdown.bitumePercent}% bitume, terrain ${mudLevel.label}) • "
+                        gpxPrefixNote = "Trace GPX (revêtement saisi : ${breakdown.bitumePercent}% bitume, terrain ${mudLevel.label}) • "
                     }
                 }
                 breakdown.overpassError != null -> {
@@ -183,17 +184,17 @@ object RecommendationEngine {
     }
 
     /**
-     * Indice UV max sur le créneau (Open-Meteo) :
-     * >= 3 -> lunettes et casquette
-     * >= 6 -> crème solaire en plus
+     * Indice UV max sur le créneau (Open-Meteo), selon les seuils de l'OMS :
+     * >= 3 -> protection nécessaire : lunettes, casquette et crème solaire
+     * >= 6 -> protection renforcée (crème à large spectre, renouveler sur les sorties longues)
      */
     fun computeUvAlert(maxUv: Double): UvAlertInfo {
         val glassesAndCap = maxUv >= 3.0
-        val sunscreen = maxUv >= 6.0
+        val sunscreen = maxUv >= 3.0
         val msg = when {
-            maxUv >= 6.0 -> "UV fort ($maxUv ≥ 6) : Lunettes + Casquette + Crème solaire indispensables."
-            maxUv >= 3.0 -> "UV modéré ($maxUv ≥ 3) : Lunettes de soleil + Casquette recommandées."
-            else -> "UV faible ($maxUv < 3) : Pas de protection solaire spécifique requise."
+            maxUv >= 6.0 -> "UV élevé ($maxUv ≥ 6) : lunettes, casquette et crème solaire, à renouveler sur les sorties longues."
+            maxUv >= 3.0 -> "UV modéré ($maxUv ≥ 3) : lunettes, casquette et crème solaire (seuil de protection de l'OMS)."
+            else -> "UV faible ($maxUv < 3) : pas de protection solaire spécifique requise."
         }
         return UvAlertInfo(
             maxUv = maxUv,
@@ -204,12 +205,12 @@ object RecommendationEngine {
     }
 
     /**
-     * Glucides/h par défaut :
-     * - 45 g/h entre 1 h et 2 h 30 (60 à 150 min)
-     * - 75 g/h au-delà (> 150 min)
-     * - < 1 h : eau seule / 0 gel obligatoire
-     * Pour les sorties de 1 h à 1 h 20 (ex. trail de 10 km), prise en compte des réserves
-     * initiales de glycogène (autonomie ~35 min) afin de recommander 1 gel (et non 3 gels).
+     * Glucides pendant l'effort (repères ACSM / Jeukendrup : rien sous ~1 h, 30-60 g/h de 1 h à 2 h 30,
+     * jusqu'à 90 g/h au-delà si l'intestin y est entraîné) :
+     * - < 1 h : eau seule, 0 gel
+     * - Les 30 premières minutes ne sont pas comptées (premier gel vers 30-45 min, l'usage courant)
+     * - Taux « moyen » (45 g/h par défaut) jusqu'à 2 h 30 d'effort, taux « long » (75 g/h par défaut)
+     *   seulement pour le temps au-delà de 2 h 30 : pas de saut brutal du nombre de gels.
      * Chaque retour ajuste de ±5 g/h, borné entre 30 et 90 g/h.
      */
     fun computeNutrition(
@@ -232,17 +233,19 @@ object RecommendationEngine {
             waterLiters
         }
 
-        val needsElectrolytes = realTempC >= 18.0 || (realTempC >= 14.0 && humidityPercent >= 75) || durationMinutes >= 90
+        val sweatyConditions = realTempC >= 18.0 || (realTempC >= 14.0 && humidityPercent >= 75)
+        val needsElectrolytes = sweatyConditions || durationMinutes >= 90
         val electrolytesAdvice = if (needsElectrolytes) {
             when {
-                realTempC >= 22.0 -> "Électrolytes indispensables (forte chaleur ${realTempC.roundToInt()}°C) : 500–700 mg de sodium / L d'eau."
-                durationMinutes >= 120 -> "Électrolytes conseillés (sortie ≥ 2 h) : 1 pastille de sodium dans votre flasque principale."
-                else -> "Ajout d'électrolytes conseillé (sudation accrue à ${realTempC.roundToInt()}°C • humidité $humidityPercent %)."
+                realTempC >= 22.0 -> "Électrolytes indispensables (chaleur ${realTempC.roundToInt()}°C) : boisson à 500–700 mg de sodium par litre."
+                durationMinutes >= 120 -> "Électrolytes conseillés (sortie ≥ 2 h) : boisson à 500–700 mg de sodium par litre dans la flasque principale."
+                sweatyConditions -> "Électrolytes conseillés (sudation accrue à ${realTempC.roundToInt()}°C • humidité $humidityPercent %)."
+                else -> "Électrolytes utiles au-delà de 1 h 30 : boisson avec du sodium ou aliment salé en cours de route."
             }
         } else ""
 
         val solidOrSaltyAdvice = if (durationMinutes >= 120 || elevationGainDPlusMeters >= 600) {
-            "Anti-saturation sucrée (> 2 h ou D+ ≥ 600 m) : alternez les gels avec 1 prise solide digeste ou salée (barre tendre, pâte d'amande ou purée salée)."
+            "Au-delà de 2 h (ou D+ ≥ 600 m) : alterner gels et petits aliments solides ou salés est souvent mieux toléré. À tester à l'entraînement avant une course."
         } else ""
 
         if (durationMinutes < 60) {
@@ -262,24 +265,18 @@ object RecommendationEngine {
             )
         }
 
-        val activeRate = if (durationMinutes <= 150) {
-            carbRateMedium.coerceIn(30, 90)
-        } else {
-            carbRateLong.coerceIn(30, 90)
-        }
+        val mediumRate = carbRateMedium.coerceIn(30, 90)
+        val longRate = carbRateLong.coerceIn(30, 90)
+        val activeRate = if (durationMinutes <= LONG_EFFORT_THRESHOLD_MINUTES) mediumRate else longRate
 
         val safeGelGrams = gelCarbsGrams.coerceAtLeast(15)
-        // Les ~30 premières minutes d'effort mobilisent le glycogène endogène ;
-        // l'apport exogène cible la durée au-delà des 30 premières minutes pour les sorties d'1h à 2h,
-        // et la durée complète sur les efforts longs.
-        val effectiveFuelingHours = if (durationMinutes <= 90) {
-            ((durationMinutes - 30).coerceAtLeast(30)) / 60.0
-        } else {
-            (durationMinutes - 20) / 60.0
-        }
-        val totalCarbs = (effectiveFuelingHours * activeRate).roundToInt()
+        val totalCarbs = computeTotalCarbsGrams(durationMinutes, mediumRate, longRate).roundToInt()
         val gelsCount = (totalCarbs.toDouble() / safeGelGrams.toDouble()).roundToInt().coerceAtLeast(1)
-        val bracketLabel = if (durationMinutes <= 150) "créneau 1 h – 2 h 30" else "créneau > 2 h 30"
+        val bracketLabel = if (durationMinutes <= LONG_EFFORT_THRESHOLD_MINUTES) {
+            "$mediumRate g/h, durée ${durationMinutes} min"
+        } else {
+            "$mediumRate g/h jusqu'à 2 h 30 puis $longRate g/h, durée ${durationMinutes} min"
+        }
 
         // Calcul du minutage précis des prises de gels (ex. +35 min, +1h05, +1h35)
         val scheduleText = buildGelIntakeSchedule(durationMinutes, gelsCount)
@@ -291,13 +288,30 @@ object RecommendationEngine {
             gelWeightGrams = safeGelGrams,
             recommendedGelsCount = gelsCount,
             waterLiters = waterLiters,
-            ruleExplanation = "Cible $activeRate g/h ($bracketLabel, durée ${durationMinutes} min) → $gelsCount gel(s) de ${safeGelGrams}g (${gelsCount * safeGelGrams} g glucides) + $waterLiters L d'eau.",
+            ruleExplanation = "Cible $bracketLabel, 30 premières min non comptées → $gelsCount gel(s) de ${safeGelGrams}g (${gelsCount * safeGelGrams} g glucides) + $waterLiters L d'eau (à ajuster à ta soif).",
             gelIntakeSchedule = scheduleText,
             electrolytesAdvice = electrolytesAdvice,
             solidOrSaltyAdvice = solidOrSaltyAdvice,
             waterRefillCount = safeRefills,
             carriedWaterPerSegmentLiters = carriedWaterLiters
         )
+    }
+
+    /** Au-delà de cette durée d'effort, le taux « long » s'applique (au temps excédentaire seulement). */
+    const val LONG_EFFORT_THRESHOLD_MINUTES = 150
+
+    /** Minutes de début d'effort non comptées dans l'apport en glucides. */
+    const val UNFUELED_START_MINUTES = 30
+
+    /**
+     * Glucides totaux (g) : taux moyen sur l'effort jusqu'à 2 h 30, taux long au-delà,
+     * hors 30 premières minutes. Fonction continue de la durée.
+     */
+    fun computeTotalCarbsGrams(durationMinutes: Int, mediumRate: Int, longRate: Int): Double {
+        if (durationMinutes < 60) return 0.0
+        val mediumMinutes = (minOf(durationMinutes, LONG_EFFORT_THRESHOLD_MINUTES) - UNFUELED_START_MINUTES).coerceAtLeast(0)
+        val longMinutes = (durationMinutes - LONG_EFFORT_THRESHOLD_MINUTES).coerceAtLeast(0)
+        return mediumMinutes / 60.0 * mediumRate + longMinutes / 60.0 * longRate
     }
 
     private fun buildGelIntakeSchedule(durationMinutes: Int, gelsCount: Int): String {
@@ -373,7 +387,8 @@ object RecommendationEngine {
         effectiveRefTempC: Double = weather.referenceTempC,
         plannedDistanceKm: Double = 10.0,
         elevationGainDPlusMeters: Int = 0,
-        sessionType: RunSessionType = RunSessionType.ENDURANCE
+        sessionType: RunSessionType = RunSessionType.ENDURANCE,
+        forestShare: Double = 0.0
     ): Pair<List<String>, List<String>> {
         val ownedCodes = gearItems.filter { it.owned }.map { it.code }.toSet()
         val outfit = mutableListOf<String>()
@@ -423,7 +438,7 @@ object RecommendationEngine {
             } else {
                 outfit.add("Veste de pluie recommandée (${weather.slotRainMm} mm • proba ${weather.maxRainProbabilityPercent} %)")
             }
-        } else if ((weather.maxWindKmh >= 22.0 || weather.maxWindGustsKmh >= 38.0) && ref < 14.0) {
+        } else if (windFeltFactor(forestShare).let { f -> weather.maxWindKmh * f >= 22.0 || weather.maxWindGustsKmh * f >= 38.0 } && ref < 14.0) {
             jacketWornFromStart = true
             if (ownedCodes.contains("coupe_vent")) {
                 outfit.add("Coupe-vent respirant (vent ${weather.maxWindKmh.roundToInt()} km/h, rafales ${weather.maxWindGustsKmh.roundToInt()} km/h ${weather.windDirectionCardinal})")
@@ -432,7 +447,9 @@ object RecommendationEngine {
             }
         }
 
-        if (!jacketWornFromStart && weather.needsJacketJustInCase) {
+        val gustsJustInCase = weather.maxWindGustsKmh * windFeltFactor(forestShare) >= 35.0
+        val needsJacketJustInCase = weather.slotRainMm < 1.0 && (weather.maxRainProbabilityPercent >= 40 || gustsJustInCase)
+        if (!jacketWornFromStart && needsJacketJustInCase) {
             val reason = if (weather.maxRainProbabilityPercent >= 40) {
                 "proba pluie ${weather.maxRainProbabilityPercent} %"
             } else {
@@ -453,16 +470,17 @@ object RecommendationEngine {
             accessories.add("Protection sommet GPX (${weather.summitElevationMeters} m : ~${weather.summitTempC}°C) : coupe-vent ou manchettes pour les crêtes")
         }
 
-        // Bas selon paliers
+        // Bas selon paliers (toujours une proposition, même sans matos coché)
         when {
             ref < 4.0 -> {
                 if (ownedCodes.contains("cuissard_long")) outfit.add("Collant / Cuissard long thermique")
-                else if (ownedCodes.contains("cuissard_court")) outfit.add("Cuissard court")
-                else outfit.add("Short de course")
+                else outfit.add("Collant long conseillé (< 4°C)")
             }
             ref < 10.0 -> {
                 if (ownedCodes.contains("cuissard_court")) outfit.add("Cuissard court (ou 3/4)")
                 else if (ownedCodes.contains("short")) outfit.add("Short de course")
+                else if (ownedCodes.contains("cuissard_long")) outfit.add("Collant long (ou cuissard court si tu as chaud)")
+                else outfit.add("Cuissard court ou short (4 à 10°C)")
             }
             else -> {
                 if (ownedCodes.contains("short")) outfit.add("Short léger respirant")
@@ -491,9 +509,9 @@ object RecommendationEngine {
             accessories.add("Guêtres de trail (boue > 15 mm/72h)")
         }
 
-        // Bâtons de trail selon le D+ ou la pente moyenne (D+/km)
+        // Bâtons de trail : seulement sur les parcours vraiment pentus (≥ 40 m D+/km) ou très longs en D+ (≥ 1000 m)
         val dPlusPerKm = if (plannedDistanceKm > 0.5) elevationGainDPlusMeters / plannedDistanceKm else 0.0
-        if (terrain == TerrainType.TRAIL && (elevationGainDPlusMeters >= 500 || dPlusPerKm >= 40.0)) {
+        if (terrain == TerrainType.TRAIL && (elevationGainDPlusMeters >= 1000 || dPlusPerKm >= 40.0)) {
             accessories.add("Bâtons de trail recommandés (${elevationGainDPlusMeters} m D+ • ${dPlusPerKm.roundToInt()} m/km)")
         }
 
@@ -548,6 +566,12 @@ object RecommendationEngine {
         }
 
         return outfit to accessories
+    }
+
+    /** Le vent est compté moitié moins sur la part de la trace en forêt. */
+    fun windFeltFactor(forestShare: Double): Double {
+        val safe = if (forestShare.isFinite()) forestShare.coerceIn(0.0, 1.0) else 0.0
+        return 1.0 - 0.5 * safe
     }
 
     /**
@@ -649,14 +673,14 @@ object RecommendationEngine {
     }
 
     /**
-     * Construit la frise chronologique fixe de nutrition Avant, Pendant (rappel sans modification) et Après la sortie.
-     * - Règles fixes déterministes, pas d'IA, pas de notifications, pas de quantités d'aliments.
-     * - Couvre :
-     *   1. La veille au soir (pour les sorties longues, les courses ou durées >= 90 min)
-     *   2. L'avant-départ (adapté à l'heure de départ : collation légère si tôt le matin < 8h30, ou repas H-3h)
-     *   3. Le pendant (reprend tel quel l'existant : gels et eau)
-     *   4. La récupération et la réhydratation immédiate (Arrivée à +30 min, adaptée à durée, intensité et température)
-     *   5. Le repas complet d'après-sortie (Arrivée + 1h30 à 2h00)
+     * Frise nutrition Avant / Pendant / Après, en règles fixes (pas d'IA), fondée sur les recommandations
+     * établies :
+     * - ACSM / Academy of Nutrition and Dietetics / Dietitians of Canada, « Nutrition and Athletic Performance » (2016)
+     * - ACSM, « Exercise and Fluid Replacement » (2007) pour l'hydratation avant et après
+     * - Jeukendrup (2014) pour les glucides pendant l'effort
+     * - Aragon & Schoenfeld (2013) : l'apport total de la journée compte plus qu'une « fenêtre » de 30 min
+     * Couvre : la veille (sorties longues / courses), l'avant-départ, le pendant (rappel), la récupération
+     * et le repas d'après-sortie.
      */
     fun buildNutritionTimeline(
         startHour: Int,
@@ -680,22 +704,18 @@ object RecommendationEngine {
 
         // 1. VEILLE AU SOIR (Sorties longues, courses ou durées >= 90 min)
         if (isLongOrRace) {
-            val eveFood = if (sessionType == RunSessionType.COURSE) {
-                "Féculents digestes à index glycémique modéré (riz blanc ou basmati, pâtes al dente, semoule, patate douce) + protéines maigres faciles à digérer + légumes cuits tendres (éviter fibres crues, épices et graisses cuites)."
+            val eveFood = if (sessionType == RunSessionType.COURSE && durationMinutes >= 90) {
+                "Dîner riche en glucides (pâtes, riz, pommes de terre, pain) et pauvre en fibres et en graisses pour limiter les troubles digestifs. Pour un effort de plus de 1 h 30, la recharge se joue surtout sur les 36–48 h avant (repas riches en glucides), pas sur ce seul dîner. Rien de nouveau la veille."
             } else {
-                "Assiette de féculents digestes (pâtes, riz, pommes de terre vapeur) + protéines légères et légumes cuits pour optimiser les réserves de glycogène musculaire."
+                "Dîner habituel avec une bonne part de féculents (pâtes, riz, pommes de terre, pain), sans excès de graisses ni d'aliments très riches en fibres si tu as l'estomac sensible."
             }
-            val eveHydration = if (isHot) {
-                "Hydratation régulière toute la soirée (eau plate + eau légèrement minéralisée pour anticiper la chaleur annoncée à ${realTempC.roundToInt()}°C)."
-            } else {
-                "Hydratation régulière à l'eau plate par petites prises jusqu'au coucher."
-            }
+            val eveHydration = "Boire normalement selon la soif : l'objectif est d'arriver au départ bien hydraté, pas de surcharger en eau."
             steps.add(
                 NutritionTimelineStep(
                     id = "eve_dinner",
                     phase = NutritionPhaseType.VEILLE_SOIR,
                     timingLabel = "Veille • 19h30 – 20h30",
-                    title = "Dîner de la veille (Recharge glycogène)",
+                    title = "Dîner de la veille",
                     foodTypesAdvice = eveFood,
                     hydrationAdvice = eveHydration,
                     contextTag = "${sessionType.label} • ${durationMinutes} min"
@@ -703,30 +723,33 @@ object RecommendationEngine {
             )
         }
 
-        // 2. AVANT-DÉPART (Adapté à l'heure matinale, l'intensité, la durée et la température)
+        val preHydrationHot = "Environ 5 à 7 mL d'eau par kg de poids (≈ 400–500 mL pour 70 kg) au moins 2 à 4 h avant ; un peu de sel ou une boisson avec du sodium aide à retenir l'eau par temps chaud."
+        val preHydrationNormal = "Environ 5 à 7 mL d'eau par kg de poids (≈ 400–500 mL pour 70 kg) dans les 2 à 4 h avant, puis selon la soif. Urines claires = bien hydraté."
+
+        // 2. AVANT-DÉPART (adapté à l'heure matinale, l'intensité et la durée)
         if (isEarlyMorning) {
-            val snackMin = startTotalMin - 45
+            val snackMin = startTotalMin - 60
             val snackEndMin = startTotalMin - 30
-            val timingStr = "${formatMinutesOfDay(snackMin)} – ${formatMinutesOfDay(snackEndMin)} (H-45 à H-30 min)"
+            val timingStr = "${formatMinutesOfDay(snackMin)} – ${formatMinutesOfDay(snackEndMin)} (H-1h à H-30 min)"
             val earlyFood = when {
-                sessionType == RunSessionType.COURSE || durationMinutes >= 120 ->
-                    "Départ matinal : collation légère mais énergétique et très digeste (banane bien mûre, compote de fruits, pain d'épices ou pain blanc grillé avec miel, ou gâteau sport digeste ; sans laitages ni graisses)."
+                sessionType == RunSessionType.COURSE || durationMinutes >= 90 ->
+                    "Départ matinal : petite collation riche en glucides et facile à digérer (banane, pain blanc + miel ou confiture, compote), pauvre en graisses et en fibres. Si possible, lève-toi plus tôt pour un vrai petit-déjeuner 2 à 3 h avant."
                 isHighIntensity ->
-                    "Départ matinal avant séance intense : glucides rapides très digestes (compote, banane mûre ou tranche de pain blanc au miel) pour éviter toute lourdeur gastrique."
+                    "Avant une séance intense : quelques glucides faciles à digérer (banane, compote, pain blanc + miel) pour ne pas partir le ventre vide, en petite quantité."
                 else ->
-                    "Départ tôt le matin : collation légère facultative ou digeste (banane mûre, compote ou biscuit sec simple) selon la faim, sans fibres ni matières grasses."
+                    "Footing de moins de 1 h 30 : la collation est facultative (banane ou compote si tu as faim). Courir en endurance à jeun le matin est en général bien toléré."
             }
             val earlyHydration = when {
-                isCold -> "Boisson chaude réconfortante (thé léger ou infusion au miel) + petites gorgées d'eau tempérée jusqu'à H-15 min."
-                isHot -> "Eau fraîche légèrement minéralisée ou boisson électrolytique par petites gorgées dès le réveil jusqu'à H-15 min."
-                else -> "Verre d'eau tempérée au réveil puis petites gorgées jusqu'à 15 min avant le départ."
+                isHot -> preHydrationHot
+                isCold -> "Un verre d'eau ou une boisson chaude au réveil, puis selon la soif. Le chaud n'hydrate ni plus ni moins, c'est une question de confort."
+                else -> "Un verre d'eau au réveil, puis selon la soif jusqu'au départ."
             }
             steps.add(
                 NutritionTimelineStep(
                     id = "pre_run_early",
                     phase = NutritionPhaseType.AVANT_DEPART,
                     timingLabel = timingStr,
-                    title = "Collation légère d'avant-départ (Matin tôt)",
+                    title = "Collation d'avant-départ (matin tôt)",
                     foodTypesAdvice = earlyFood,
                     hydrationAdvice = earlyHydration,
                     contextTag = "Départ matinal (${formatMinutesOfDay(startTotalMin)}) • ${realTempC.roundToInt()}°C"
@@ -742,111 +765,107 @@ object RecommendationEngine {
             }
             val normalFood = when {
                 sessionType == RunSessionType.COURSE ->
-                    "À H-3h : repas pré-course digeste (flocons d'avoine ou pain blanc/levain + miel/confiture + compote ou banane mûre). À H-1h : petite collation glucidique digeste si besoin."
+                    "À H-3h : repas riche en glucides (pain, flocons d'avoine, riz, pâtes + miel, confiture ou fruit), pauvre en graisses et en fibres, avec un peu de protéines. À H-1h : petite collation glucidique si besoin. Uniquement des aliments déjà testés à l'entraînement."
                 isHighIntensity ->
-                    "À H-3h : glucides complexes digestes (pain grillé, avoine, riz au lait léger ou compote). À H-1h : fruit mûr ou compote légère avant l'échauffement."
+                    "À H-3h : repas riche en glucides et peu gras (pain, riz, pâtes, avoine). À H-1h : un fruit mûr ou une compote si tu as faim."
                 isLongOrRace ->
-                    "À H-3h : féculents ou céréales digestes (pain, avoine, pancake maison léger) + fruit cuit/mûr et source légère de protéines ; éviter graisses et crudités."
+                    "À H-3h : repas riche en glucides (pain, avoine, riz, pâtes), modéré en protéines, pauvre en graisses et en fibres pour le confort digestif."
                 else ->
-                    "Repas habituel digeste pris 2h à 3h avant de courir (féculents/pain + fruit mûr), en limitant les aliments riches en graisses et fibres crues."
-            }
-            val normalHydration = when {
-                isHot -> "Pré-hydratation fraîche régulière (eau minéralisée ou électrolytes) par petites gorgées jusqu'à 15 min du départ."
-                isCold -> "Eau tempérée ou boisson chaude légère (infusion/thé) jusqu'à 20 min avant le départ pour partir bien réchauffé."
-                else -> "Hydratation régulière à l'eau plate par petites gorgées jusqu'à 15 min avant le départ."
+                    "Repas habituel pris 2 à 3 h avant de courir, en évitant les plats très gras ou très riches en fibres juste avant."
             }
             steps.add(
                 NutritionTimelineStep(
                     id = "pre_run_normal",
                     phase = NutritionPhaseType.AVANT_DEPART,
                     timingLabel = timingStr,
-                    title = "Repas & Hydratation d'avant-départ",
+                    title = "Repas & hydratation d'avant-départ",
                     foodTypesAdvice = normalFood,
-                    hydrationAdvice = normalHydration,
+                    hydrationAdvice = if (isHot) preHydrationHot else preHydrationNormal,
                     contextTag = "Départ ${formatMinutesOfDay(startTotalMin)} • ${sessionType.label}"
                 )
             )
         }
 
-        // 3. PENDANT LA SORTIE (Rappel strict de l'existant sans aucune modification)
+        // 3. PENDANT LA SORTIE (rappel des règles actives : gels et eau)
         steps.add(
             NutritionTimelineStep(
                 id = "during_run",
                 phase = NutritionPhaseType.PENDANT_SORTIE,
                 timingLabel = "${formatMinutesOfDay(startTotalMin)} – ${formatMinutesOfDay(endTotalMin)} (${durationMinutes} min)",
-                title = "Pendant la sortie (Gels & Eau — Règles actives)",
+                title = "Pendant la sortie (gels & eau)",
                 foodTypesAdvice = if (duringNutrition.recommendedGelsCount > 0) {
                     "${duringNutrition.recommendedGelsCount} gel(s) de ${duringNutrition.gelWeightGrams}g (cible ${duringNutrition.targetCarbPerHour} g/h) répartis régulièrement."
                 } else {
-                    "Sortie < 1 h : aucun gel requis, réserves de glycogène suffisantes."
+                    "Sortie de moins de 1 h : aucun apport nécessaire."
                 },
-                hydrationAdvice = "Eau : ${duringNutrition.waterLiters} L sur le créneau par petites gorgées régulières.",
+                hydrationAdvice = "Eau : environ ${duringNutrition.waterLiters} L sur le créneau, par petites gorgées, à ajuster à la soif.",
                 contextTag = "Pendant l'effort"
             )
         )
 
-        // 4. RÉCUPÉRATION & RÉHYDRATATION IMMÉDIATE (Arrivée à Arrivée + 30 min)
-        val recupEndMin = endTotalMin + 30
-        val recupTiming = "${formatMinutesOfDay(endTotalMin)} – ${formatMinutesOfDay(recupEndMin)} (Arrivée + 30 min)"
-        val recupFood = when {
-            sessionType == RunSessionType.COURSE || durationMinutes >= 120 ->
-                "Fenêtre métabolique prioritaire : duo Glucides rapides + Protéines digestes (banane bien mûre, fruits secs/dattes + boisson de récupération, yaourt protéiné ou poignée d'amandes) pour recharger le glycogène et réparer les fibres."
-            isHighIntensity || durationMinutes >= 60 ->
-                "Association Glucides assimilables + Protéines (compote ou fruit frais + barre protéinée, laitage/alternative végétale soja ou oléagineux)."
-            else ->
-                "Collation légère de retour au calme : fruit frais de saison ou compote si la faim se fait sentir avant le prochain repas."
+        // 4. RÉCUPÉRATION (dans les 2 h après l'arrivée)
+        val needsFastRecovery = sessionType == RunSessionType.COURSE || durationMinutes >= 90 || isHighIntensity
+        val recupEndMin = endTotalMin + 120
+        val recupTiming = "${formatMinutesOfDay(endTotalMin)} – ${formatMinutesOfDay(recupEndMin)} (dans les 2 h)"
+        val recupFood = if (needsFastRecovery) {
+            "Glucides + 20 à 25 g de protéines dans les 2 h (ex. laitage ou boisson lactée + fruit, sandwich jambon/œuf/fromage, riz + œufs). Utile surtout si tu recours dans les 24 h ; sinon tes repas normaux suffisent, l'apport total de la journée compte plus que l'horaire exact."
+        } else {
+            "Rien de spécial : ton prochain repas suffit. Une collation (fruit, yaourt) si tu as faim d'ici là."
         }
         val recupHydration = when {
-            isHot && isLongOrRace ->
-                "Réhydratation intense (chaleur ${realTempC.roundToInt()}°C + effort long) : eau bicarbonatée fraîche ou boisson riche en électrolytes (sodium, magnésium) par petites gorgées continues."
-            isHot ->
-                "Chaleur (${realTempC.roundToInt()}°C) : eau fraîche minéralisée ou bicarbonatée pour compenser la sudation et les sels minéraux perdus."
+            isHot || durationMinutes >= 90 ->
+                "Remplacer les pertes : environ 1,25 à 1,5 L par kg perdu (pèse-toi avant et après si tu veux le chiffrer), avec du sodium (boisson salée, bouillon, repas salé) pour retenir l'eau."
             isCold ->
-                "Froid (${realTempC.roundToInt()}°C) : commencer par quelques gorgées d'eau tempérée puis boisson chaude minéralisée, infusion miellée ou bouillon salé réchauffant."
-            isLongOrRace || isHighIntensity ->
-                "Eau bicarbonatée / minéralisée par petites gorgées pour réhydrater et tamponner l'acidité musculaire."
+                "Boire selon la soif ; une boisson chaude est agréable mais n'hydrate ni plus ni moins que l'eau."
             else ->
-                "Eau plate ou légèrement minéralisée par petites gorgées dès l'arrivée."
+                "Boire selon la soif dès l'arrivée."
         }
         steps.add(
             NutritionTimelineStep(
                 id = "post_run_immediate",
                 phase = NutritionPhaseType.RECUP_IMMEDIATE,
                 timingLabel = recupTiming,
-                title = "Récupération & Réhydratation immédiate",
+                title = "Récupération & réhydratation",
                 foodTypesAdvice = recupFood,
                 hydrationAdvice = recupHydration,
-                contextTag = "Fenêtre 30 min • ${realTempC.roundToInt()}°C"
+                contextTag = "Après l'arrivée • ${realTempC.roundToInt()}°C"
             )
         )
 
-        // 5. REPAS D'APRÈS-SORTIE (Arrivée + 1h30 à 2h00)
+        // 5. REPAS D'APRÈS-SORTIE
         val mealPostStart = endTotalMin + 90
-        val mealPostEnd = endTotalMin + 120
-        val postMealTiming = "${formatMinutesOfDay(mealPostStart)} – ${formatMinutesOfDay(mealPostEnd)} (Arrivée + 1h30 à 2h)"
+        val mealPostEnd = endTotalMin + 180
+        val postMealTiming = "${formatMinutesOfDay(mealPostStart)} – ${formatMinutesOfDay(mealPostEnd)} (prochain repas)"
         val postMealFood = if (isLongOrRace || isHighIntensity) {
-            "Repas complet réparateur et alcalinisant : féculents (riz, pâtes, pommes de terre, patate douce, quinoa) + protéines complètes (poisson, œufs, volaille, tofu/légumineuses) + légumes colorés riches en antioxydants + bons lipides oméga-3 (huile de colza/noix, avocat)."
+            "Repas complet : bonne part de féculents pour recharger le glycogène, une source de protéines (viande, poisson, œufs, laitages, légumineuses ou tofu) et des légumes."
         } else {
-            "Repas équilibré habituel : céréales/féculents, source de protéines, légumes de saison et bonnes huiles végétales."
+            "Repas équilibré habituel : féculents, protéines et légumes."
         }
         val postMealHydration = if (isHot || isLongOrRace) {
-            "Poursuivre l'hydratation à l'eau plate pendant et après le repas (ajouter une touche salée au repas pour restaurer le sodium)."
+            "Continuer à boire pendant et après le repas ; saler normalement aide à récupérer le sodium perdu."
         } else {
-            "Continuer à boire de l'eau plate régulièrement dans les heures qui suivent."
+            "Boire normalement selon la soif."
         }
         steps.add(
             NutritionTimelineStep(
                 id = "post_run_meal",
                 phase = NutritionPhaseType.REPAS_APRES,
                 timingLabel = postMealTiming,
-                title = "Repas complet d'après-sortie",
+                title = "Repas d'après-sortie",
                 foodTypesAdvice = postMealFood,
                 hydrationAdvice = postMealHydration,
-                contextTag = "Reconstruction musculaire"
+                contextTag = "Récupération"
             )
         )
 
         return steps
+    }
+
+    /** Part de la trace en terre / forêt (0..1), seulement si le revêtement est connu (OSM ou saisi). */
+    fun forestShareOf(gpxTrack: GpxTrackAnalysis?): Double {
+        val breakdown = gpxTrack?.surfaceBreakdown ?: return 0.0
+        if (breakdown.overpassError != null) return 0.0
+        return (breakdown.terreForetPercent / 100.0).coerceIn(0.0, 1.0)
     }
 
     /**
@@ -873,6 +892,7 @@ object RecommendationEngine {
         thermalProfile: ThermalProfile = ThermalProfile.NEUTRE,
         waterRefillCount: Int = 0
     ): FullRunRecommendation {
+        val forestShare = forestShareOf(gpxTrack)
         val ownedCodes = gearItems.filter { it.owned }.map { it.code }.toSet()
         val mudAlert = computeMudAlert(terrain, weather.past72hRainMm, ownedCodes)
         val uvAlert = computeUvAlert(weather.maxUvIndex)
@@ -916,7 +936,8 @@ object RecommendationEngine {
             effectiveRefTempC = effectiveRefTemp,
             plannedDistanceKm = plannedDistanceKm,
             elevationGainDPlusMeters = elevationGainDPlusMeters,
-            sessionType = sessionType
+            sessionType = sessionType,
+            forestShare = forestShare
         )
         val similarRuns = findSimilarRuns(weather, history)
 

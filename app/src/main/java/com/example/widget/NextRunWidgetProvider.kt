@@ -61,16 +61,10 @@ class NextRunWidgetProvider : AppWidgetProvider() {
             appWidgetId: Int
         ) {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            val subtitle = prefs.getString(KEY_SUBTITLE, "Chamonix • Trail 18 km")
-            val refTemp = prefs.getString(KEY_REF_TEMP, "Réf 11°C")
-            val outfit = prefs.getString(
-                KEY_OUTFIT,
-                "Tenue : T-shirt manches courtes, Short, Chaussures Trail, 2 gels"
-            )
-            val alerts = prefs.getString(
-                KEY_ALERTS,
-                "Alertes : Boue Humide • UV 4 (Lunettes + Casquette)"
-            )
+            val subtitle = prefs.getString(KEY_SUBTITLE, "Ouvre l'appli pour préparer ta sortie")
+            val refTemp = prefs.getString(KEY_REF_TEMP, "Réf —")
+            val outfit = prefs.getString(KEY_OUTFIT, "Tenue : —")
+            val alerts = prefs.getString(KEY_ALERTS, "Alertes : —")
 
             val views = RemoteViews(context.packageName, R.layout.widget_next_run)
             views.setTextViewText(R.id.widget_subtitle, subtitle)

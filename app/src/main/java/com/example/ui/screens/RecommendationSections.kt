@@ -1,9 +1,5 @@
 package com.example.ui.screens
 
-import android.Manifest
-import android.os.Build
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -35,7 +31,6 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.History
-import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
@@ -67,6 +62,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.example.data.local.ChecklistItemEntity
 import com.example.data.local.RunHistoryEntity
+import com.example.data.local.ShoeEntity
 import com.example.data.model.ChecklistType
 import com.example.data.model.GelFeedback
 import com.example.data.model.NutritionPhaseType
@@ -559,16 +555,9 @@ fun ChecklistCard(
 fun RetroplanningCard(
     config: RetroplanningConfig,
     steps: List<RetroplanningStep>,
-    onUpdateConfig: (Int, Int, Int, Int, Int, Int) -> Unit,
-    onScheduleNotifications: () -> Unit
+    onUpdateConfig: (Int, Int, Int, Int, Int, Int) -> Unit
 ) {
     var showEditDialog by remember { mutableStateOf(false) }
-
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { _ ->
-        onScheduleNotifications()
-    }
 
     Card(
         modifier = Modifier
@@ -652,34 +641,13 @@ fun RetroplanningCard(
             }
 
             Spacer(modifier = Modifier.height(12.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            OutlinedButton(
+                onClick = { showEditDialog = true },
+                modifier = Modifier.fillMaxWidth()
             ) {
-                OutlinedButton(
-                    onClick = { showEditDialog = true },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Ajuster durées")
-                }
-                Button(
-                    onClick = {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                        } else {
-                            onScheduleNotifications()
-                        }
-                    },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("schedule_retroplanning_notifications_button")
-                ) {
-                    Icon(Icons.Default.NotificationsActive, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Notifications")
-                }
+                Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Ajuster durées")
             }
         }
     }
@@ -793,6 +761,7 @@ private fun RetroplanningEditDialog(
 @Composable
 fun PostRunFeedbackDialog(
     recommendation: FullRunRecommendation,
+    shoes: List<ShoeEntity>,
     onDismiss: () -> Unit,
     onConfirm: (
         actualDistanceKm: Double,
@@ -801,9 +770,11 @@ fun PostRunFeedbackDialog(
         gelFeedback: GelFeedback,
         gelsCarried: Int,
         outfitText: String,
-        notes: String
+        notes: String,
+        wornShoeId: Long?
     ) -> Unit
 ) {
+    var wornShoeId by remember { mutableStateOf(recommendation.selectedShoe?.id) }
     var actualDistanceText by remember { mutableStateOf(recommendation.plannedDistanceKm.toString()) }
     var actualDPlusText by remember { mutableStateOf(recommendation.elevationGainDPlusMeters.toString()) }
     var selectedFeeling by remember { mutableStateOf(ThermalFeeling.PARFAIT) }
@@ -831,10 +802,35 @@ fun PostRunFeedbackDialog(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "Les km réels seront ajoutés à ${recommendation.selectedShoe?.name ?: "votre paire"} et votre retour sur les gels ajustera votre cible glucidique (±5 g/h).",
+                    text = "Les km réels seront ajoutés à la paire réellement portée, et ton retour sur les gels ajustera ta cible glucidique (±5 g/h).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+
+                if (shoes.isNotEmpty()) {
+                    Text(
+                        text = "Chaussures portées",
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        shoes.forEach { shoe ->
+                            FilterChip(
+                                selected = wornShoeId == shoe.id,
+                                onClick = { wornShoeId = shoe.id },
+                                label = { Text("${shoe.name} (${shoe.currentKm.roundToInt()} km)") },
+                                modifier = Modifier.testTag("post_run_shoe_${shoe.id}")
+                            )
+                        }
+                        FilterChip(
+                            selected = wornShoeId == null,
+                            onClick = { wornShoeId = null },
+                            label = { Text("Non renseignée") }
+                        )
+                    }
+                }
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -933,7 +929,7 @@ fun PostRunFeedbackDialog(
                         ?: recommendation.elevationGainDPlusMeters
                     val gels = gelsCarriedText.toIntOrNull()
                         ?: recommendation.nutrition.recommendedGelsCount
-                    onConfirm(dist, dPlus, selectedFeeling, selectedGelFeedback, gels, outfitText, notesText)
+                    onConfirm(dist, dPlus, selectedFeeling, selectedGelFeedback, gels, outfitText, notesText, wornShoeId)
                 },
                 modifier = Modifier.testTag("confirm_post_run_button")
             ) {

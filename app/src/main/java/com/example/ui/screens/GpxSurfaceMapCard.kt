@@ -28,7 +28,6 @@ import androidx.compose.material.icons.filled.Route
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -83,8 +82,6 @@ fun colorForSurface(category: SurfaceCategory): Color = when (category) {
 fun GpxImportBarSection(
     gpxTrack: GpxTrackAnalysis?,
     onPickGpxFileClick: () -> Unit,
-    onLoadSampleTrailGpx: () -> Unit,
-    onLoadSampleRoadGpx: () -> Unit,
     onClearGpx: () -> Unit
 ) {
     Surface(
@@ -160,22 +157,6 @@ fun GpxImportBarSection(
                     Text("Importer une trace GPX", maxLines = 1, softWrap = false)
                 }
             }
-
-            FlowRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                AssistChip(
-                    onClick = onLoadSampleTrailGpx,
-                    label = { Text("Exemple GPX Sentier (Chamonix)") },
-                    modifier = Modifier.testTag("sample_trail_gpx_chip")
-                )
-                AssistChip(
-                    onClick = onLoadSampleRoadGpx,
-                    label = { Text("Exemple GPX >60% Bitume (Annecy)") },
-                    modifier = Modifier.testTag("sample_road_gpx_chip")
-                )
-            }
         }
     }
 }
@@ -224,10 +205,8 @@ fun GpxSurfaceAnalysisCard(
                     )
                     Column {
                         Text(
-                            text = if (breakdown?.isManualOrOfflineEstimate == true && breakdown.overpassError == null) {
-                                "Revêtement personnalisé"
-                            } else if (breakdown?.isManualOrOfflineEstimate == true) {
-                                "Revêtement estimé (Hors-ligne)"
+                            text = if (breakdown?.isManualOrOfflineEstimate == true) {
+                                "Revêtement saisi à la main"
                             } else {
                                 "Analyse du revêtement (Overpass OSM)"
                             },
@@ -409,7 +388,11 @@ fun GpxSurfaceAnalysisCard(
 
                 // Carte de la trace colorée par catégorie
                 Text(
-                    text = "Carte de la trace colorée par revêtement",
+                    text = when {
+                        breakdown.isManualOrOfflineEstimate -> "Tracé (répartition saisie à la main, non localisée sur la carte)"
+                        breakdown.overpassError != null -> "Tracé (revêtement inconnu)"
+                        else -> "Carte de la trace colorée par revêtement"
+                    },
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
                 )

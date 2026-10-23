@@ -32,7 +32,24 @@ class ExampleRobolectricTest {
 
     @Test
     fun `parse sample GPX extracts distance, elevation gain D+ and start point`() {
-        val rawXml = GpxAndOverpassAnalyzer.getSampleTrailGpxXml()
+        val rawXml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <gpx version="1.1" creator="test">
+              <trk>
+                <name>Boucle test</name>
+                <trkseg>
+                  <trkpt lat="45.9237" lon="6.8694"><ele>1035</ele></trkpt>
+                  <trkpt lat="45.9265" lon="6.8732"><ele>1085</ele></trkpt>
+                  <trkpt lat="45.9301" lon="6.8785"><ele>1140</ele></trkpt>
+                  <trkpt lat="45.9348" lon="6.8840"><ele>1210</ele></trkpt>
+                  <trkpt lat="45.9395" lon="6.8895"><ele>1265</ele></trkpt>
+                  <trkpt lat="45.9430" lon="6.8950"><ele>1310</ele></trkpt>
+                  <trkpt lat="45.9402" lon="6.8982"><ele>1245</ele></trkpt>
+                  <trkpt lat="45.9237" lon="6.8694"><ele>1035</ele></trkpt>
+                </trkseg>
+              </trk>
+            </gpx>
+        """.trimIndent()
         val parsed = GpxAndOverpassAnalyzer.parseGpxContent(rawXml, "Test.gpx")
         assertNotNull(parsed)
         assertTrue(parsed!!.totalDistanceKm > 0.5)

@@ -5,26 +5,26 @@ import com.example.data.model.GeoLocationResult
 import com.example.data.model.HourlyWeatherStep
 import com.example.data.model.RunSessionType
 import com.example.data.model.WeatherSlotAnalysis
+import com.example.domain.SunTimes
 import com.squareup.moshi.Json
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.delay
-import okhttp3.Dns
 import okhttp3.OkHttpClient
 import retrofit2.Retrofit
 import retrofit2.converter.moshi.MoshiConverterFactory
 import retrofit2.http.GET
 import retrofit2.http.Query
-import java.net.InetAddress
-import java.net.UnknownHostException
 import java.text.SimpleDateFormat
 import java.util.Calendar
-import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 data class OpenMeteoForecastResponse(
     @Json(name = "latitude") val latitude: Double,
@@ -104,6 +104,30 @@ interface OpenMeteoGeocodingService {
     ): OpenMeteoGeocodingResponse
 }
 
+/**
+ * Règle d'utilisation du cache météo hors-ligne : uniquement pour le même lieu (≤ 5 km)
+ * et s'il a moins de 12 h. Au-delà, l'appli affiche « météo indisponible ».
+ */
+object WeatherCachePolicy {
+    const val MAX_AGE_MILLIS = 12L * 3600L * 1000L
+    const val MAX_DISTANCE_METERS = 5000.0
+
+    fun isUsable(
+        cachedLat: Double,
+        cachedLon: Double,
+        cachedAtMillis: Long,
+        latitude: Double,
+        longitude: Double,
+        nowMillis: Long = System.currentTimeMillis()
+    ): Boolean {
+        if (!cachedLat.isFinite() || !cachedLon.isFinite() || cachedAtMillis <= 0L) return false
+        val age = nowMillis - cachedAtMillis
+        if (age < 0L || age > MAX_AGE_MILLIS) return false
+        val dist = GpxAndOverpassAnalyzer.haversineMeters(cachedLat, cachedLon, latitude, longitude)
+        return dist.isFinite() && dist <= MAX_DISTANCE_METERS
+    }
+}
+
 object OpenMeteoClient {
     private val moshi: Moshi = Moshi.Builder()
         .add(KotlinJsonAdapterFactory())
@@ -113,36 +137,9 @@ object OpenMeteoClient {
         moshi.adapter(OpenMeteoForecastResponse::class.java)
     }
 
-    private val openMeteoResilientDns = object : Dns {
-        private val staticIps = mapOf(
-            "api.open-meteo.com" to listOf(
-                InetAddress.getByAddress("api.open-meteo.com", byteArrayOf(157.toByte(), 90.toByte(), 83.toByte(), 168.toByte()))
-            ),
-            "geocoding-api.open-meteo.com" to listOf(
-                InetAddress.getByAddress("geocoding-api.open-meteo.com", byteArrayOf(202.toByte(), 61.toByte(), 206.toByte(), 6.toByte()))
-            ),
-            "archive-api.open-meteo.com" to listOf(
-                InetAddress.getByAddress("archive-api.open-meteo.com", byteArrayOf(157.toByte(), 90.toByte(), 83.toByte(), 168.toByte()))
-            )
-        )
-
-        override fun lookup(hostname: String): List<InetAddress> {
-            val lower = hostname.lowercase(Locale.ROOT)
-            return try {
-                val resolved = Dns.SYSTEM.lookup(hostname)
-                if (resolved.isNotEmpty()) resolved else staticIps[lower] ?: emptyList()
-            } catch (_: UnknownHostException) {
-                staticIps[lower] ?: throw UnknownHostException("Impossible de résoudre l'hôte météo $hostname")
-            } catch (_: Exception) {
-                staticIps[lower] ?: throw UnknownHostException("Erreur DNS sur l'hôte météo $hostname")
-            }
-        }
-    }
-
     private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
-        .dns(openMeteoResilientDns)
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
     val forecastService: OpenMeteoForecastService by lazy {
@@ -190,7 +187,7 @@ object OpenMeteoClient {
             } catch (e: Exception) {
                 lastException = e
                 if (attempt < maxAttempts) {
-                    delay(450L)
+                    delay(600L)
                 }
             }
         }
@@ -229,8 +226,9 @@ object OpenMeteoClient {
     }
 
     /**
-     * Récupère la météo historique réelle à une date passée (et sur les 72 h précédentes pour le cumul de boue)
-     * via Open-Meteo (Forecast API pour les 85 derniers jours, ou Archive ERA5 API au-delà).
+     * Récupère la météo réelle à une date passée (et les 72 h précédentes pour le cumul de boue)
+     * via Open-Meteo (Forecast API pour les ~80 derniers jours, Archive ERA5 au-delà).
+     * Lève une exception si le réseau est indisponible ; renvoie null si les données manquent.
      */
     suspend fun fetchHistoricalSlotWeather(
         locationName: String,
@@ -240,7 +238,7 @@ object OpenMeteoClient {
         startHourOfDay: Int,
         durationMinutes: Int,
         sessionType: RunSessionType
-    ): WeatherSlotAnalysis {
+    ): WeatherSlotAnalysis? {
         val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
         val endCal = Calendar.getInstance().apply {
             timeInMillis = targetDateMillis
@@ -291,7 +289,7 @@ object OpenMeteoClient {
         return analyzeHistoricalDateSlotFromResponse(
             response = response,
             locationName = locationName,
-            targetDateStr = endDateStr,
+            targetDate = endCal,
             startHourOfDay = startHourOfDay,
             durationMinutes = durationMinutes,
             sessionType = sessionType
@@ -301,43 +299,42 @@ object OpenMeteoClient {
     fun analyzeHistoricalDateSlotFromResponse(
         response: OpenMeteoForecastResponse,
         locationName: String,
-        targetDateStr: String,
+        targetDate: Calendar,
         startHourOfDay: Int,
         durationMinutes: Int,
         sessionType: RunSessionType
-    ): WeatherSlotAnalysis {
-        val hourly = response.hourly
-        val times = hourly?.time.orEmpty()
-        if (times.isEmpty()) {
-            return fallbackAnalysis(locationName, response.latitude, response.longitude, startHourOfDay, durationMinutes, sessionType)
-        }
+    ): WeatherSlotAnalysis? {
+        val times = response.hourly?.time.orEmpty()
+        if (times.isEmpty()) return null
 
         val hourPadded = String.format(Locale.US, "%02d", startHourOfDay.coerceIn(0, 23))
+        val targetDateStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(targetDate.time)
         val targetPrefix = "${targetDateStr}T$hourPadded:"
 
-        var startIndex = times.indexOfFirst { it.startsWith(targetPrefix) }
-        if (startIndex < 0) {
-            startIndex = (times.size - 24 + startHourOfDay.coerceIn(0, 23)).coerceIn(0, times.lastIndex)
-        }
+        val startIndex = times.indexOfFirst { it.startsWith(targetPrefix) }
+        if (startIndex < 0) return null
 
         return extractSlotAnalysis(
             response = response,
             locationName = locationName,
             startIndex = startIndex,
             startHourOfDay = startHourOfDay,
+            startMinute = 0,
             durationMinutes = durationMinutes,
             sessionType = sessionType,
-            fallbackIsoPrefix = "${targetDateStr}T${hourPadded}:"
+            targetDate = targetDate
         )
     }
 
     /**
-     * Analyse le créneau horaire choisi et calcule :
-     * - Cumul de pluie des 72 h précédentes (past_days=3)
+     * Analyse le créneau choisi et calcule :
+     * - Cumul de pluie des 72 h précédant le départ (pluie prévue incluse)
      * - Température réelle, ressentie et amplitude sur le créneau
      * - Température de référence (ajustée selon vent, rafales, pluie, humidité, UV et type de séance)
-     * - Probabilité de pluie (%), sens du vent, rafales et code météo WMO sur le créneau
-     * - Évolution heure par heure pendant la sortie et température estimée au point culminant GPX
+     * - Probabilité de pluie (%), direction dominante du vent, rafales et code météo WMO le plus défavorable
+     * - Évolution heure par heure et température estimée au point culminant GPX
+     * - Nuit / jour d'après le lever et le coucher du soleil calculés pour le lieu et la date
+     * Renvoie null si la réponse ne couvre pas le créneau demandé (aucune valeur inventée).
      */
     fun analyzeSlotFromResponse(
         response: OpenMeteoForecastResponse,
@@ -346,42 +343,42 @@ object OpenMeteoClient {
         dayOffsetFromToday: Int,
         durationMinutes: Int,
         sessionType: RunSessionType,
+        startMinute: Int = 0,
         minTrackEleMeters: Int? = null,
         maxTrackEleMeters: Int? = null,
+        forestShare: Double = 0.0,
         fetchedAtTimeLabel: String = "",
-        isFromOfflineCache: Boolean = false
-    ): WeatherSlotAnalysis {
-        val hourly = response.hourly
-        val times = hourly?.time.orEmpty()
-        if (times.isEmpty()) {
-            return fallbackAnalysis(locationName, response.latitude, response.longitude, startHourOfDay, durationMinutes, sessionType)
-        }
+        isFromOfflineCache: Boolean = false,
+        now: Calendar = Calendar.getInstance()
+    ): WeatherSlotAnalysis? {
+        val times = response.hourly?.time.orEmpty()
+        if (times.isEmpty()) return null
 
-        val targetCal = Calendar.getInstance().apply {
+        val targetCal = (now.clone() as Calendar).apply {
             add(Calendar.DAY_OF_YEAR, dayOffsetFromToday.coerceIn(0, 6))
             set(Calendar.HOUR_OF_DAY, startHourOfDay.coerceIn(0, 23))
             set(Calendar.MINUTE, 0)
             set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
         }
         val isoPrefixFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:", Locale.US)
         val targetPrefix = isoPrefixFormat.format(targetCal.time)
 
-        var startIndex = times.indexOfFirst { it.startsWith(targetPrefix) }
-        if (startIndex < 0) {
-            // Fallback : past_days=3 => 72h avant aujourd'hui 00:00
-            startIndex = (72 + dayOffsetFromToday * 24 + startHourOfDay).coerceIn(0, times.lastIndex)
-        }
+        val startIndex = times.indexOfFirst { it.startsWith(targetPrefix) }
+        if (startIndex < 0) return null
 
         return extractSlotAnalysis(
             response = response,
             locationName = locationName,
             startIndex = startIndex,
             startHourOfDay = startHourOfDay,
+            startMinute = startMinute,
             durationMinutes = durationMinutes,
             sessionType = sessionType,
-            fallbackIsoPrefix = targetPrefix,
+            targetDate = targetCal,
             minTrackEleMeters = minTrackEleMeters,
             maxTrackEleMeters = maxTrackEleMeters,
+            forestShare = forestShare,
             fetchedAtTimeLabel = fetchedAtTimeLabel,
             isFromOfflineCache = isFromOfflineCache
         )
@@ -392,62 +389,63 @@ object OpenMeteoClient {
         locationName: String,
         startIndex: Int,
         startHourOfDay: Int,
+        startMinute: Int,
         durationMinutes: Int,
         sessionType: RunSessionType,
-        fallbackIsoPrefix: String,
+        targetDate: Calendar,
         minTrackEleMeters: Int? = null,
         maxTrackEleMeters: Int? = null,
+        forestShare: Double = 0.0,
         fetchedAtTimeLabel: String = "",
         isFromOfflineCache: Boolean = false
-    ): WeatherSlotAnalysis {
-        val hourly = response.hourly
-        val times = hourly?.time.orEmpty()
-        val slotHoursCount = max(1, (durationMinutes + 59) / 60)
+    ): WeatherSlotAnalysis? {
+        val hourly = response.hourly ?: return null
+        val times = hourly.time
+        val safeStartMinute = startMinute.coerceIn(0, 59)
+        val slotHoursCount = max(1, (safeStartMinute + durationMinutes + 59) / 60)
         val endIndex = (startIndex + slotHoursCount - 1).coerceAtMost(times.lastIndex)
         val slotIndices = startIndex..endIndex
 
-        val temps = slotIndices.mapNotNull { hourly?.temperature2m?.getOrNull(it) }
-        val appTemps = slotIndices.mapNotNull { hourly?.apparentTemperature?.getOrNull(it) }
-        val winds = slotIndices.mapNotNull { hourly?.windSpeed10m?.getOrNull(it) }
-        val gusts = slotIndices.mapNotNull { hourly?.windGusts10m?.getOrNull(it) }
-        val windDirs = slotIndices.mapNotNull { hourly?.windDirection10m?.getOrNull(it) }
-        val rains = slotIndices.mapNotNull { hourly?.precipitation?.getOrNull(it) }
-        val rainProbs = slotIndices.mapNotNull { hourly?.precipitationProbability?.getOrNull(it) }
-        val humidities = slotIndices.mapNotNull { hourly?.relativeHumidity2m?.getOrNull(it) }
-        val uvs = slotIndices.mapNotNull { hourly?.uvIndex?.getOrNull(it) }
-        val codes = slotIndices.mapNotNull { hourly?.weatherCode?.getOrNull(it) }
-        val radiations = slotIndices.mapNotNull { hourly?.shortwaveRadiation?.getOrNull(it) }
+        val temps = slotIndices.mapNotNull { hourly.temperature2m.getOrNull(it) }
+        // Sans température sur le créneau, on ne recommande rien plutôt que d'inventer une valeur.
+        if (temps.isEmpty()) return null
 
-        val avgTemp = if (temps.isNotEmpty()) temps.average() else 12.0
+        val appTemps = slotIndices.mapNotNull { hourly.apparentTemperature.getOrNull(it) }
+        val winds = slotIndices.mapNotNull { hourly.windSpeed10m.getOrNull(it) }
+        val gusts = slotIndices.mapNotNull { hourly.windGusts10m.getOrNull(it) }
+        val rains = slotIndices.mapNotNull { hourly.precipitation.getOrNull(it) }
+        val rainProbs = slotIndices.mapNotNull { hourly.precipitationProbability.getOrNull(it) }
+        val humidities = slotIndices.mapNotNull { hourly.relativeHumidity2m.getOrNull(it) }
+        val uvs = slotIndices.mapNotNull { hourly.uvIndex.getOrNull(it) }
+        val codes = slotIndices.mapNotNull { hourly.weatherCode.getOrNull(it) }
+        val radiations = slotIndices.mapNotNull { hourly.shortwaveRadiation.getOrNull(it) }
+
+        val avgTemp = temps.average()
         val avgAppTemp = if (appTemps.isNotEmpty()) appTemps.average() else avgTemp
-        val tempDelta = if (temps.size >= 2) (temps.maxOrNull()!! - temps.minOrNull()!!) else 0.0
-        val maxWind = winds.maxOrNull() ?: 10.0
-        val maxGust = gusts.maxOrNull() ?: (maxWind * 1.35)
+        val tempDelta = if (temps.size >= 2) (temps.max() - temps.min()) else 0.0
+        val maxWind = winds.maxOrNull() ?: 0.0
+        val maxGust = gusts.maxOrNull() ?: maxWind
         val slotRain = rains.sum()
-        val maxRainProb = rainProbs.maxOrNull() ?: when {
-            slotRain >= 2.0 -> 85
-            slotRain >= 0.5 -> 60
-            slotRain > 0.0 -> 45
-            else -> 15
-        }
-        val avgHumidity = if (humidities.isNotEmpty()) humidities.average().roundToInt().coerceIn(10, 100) else 65
-        val dominantWindDeg = if (windDirs.isNotEmpty()) windDirs.first() else 225
+        // Sorties passées (archive) : pas de probabilité, la pluie observée fait foi.
+        val maxRainProb = rainProbs.maxOrNull() ?: if (slotRain >= 0.1) 100 else 0
+        val avgHumidity = if (humidities.isNotEmpty()) humidities.average().roundToInt().coerceIn(1, 100) else 65
+        val dominantWindDeg = dominantWindDirection(
+            directions = slotIndices.map { hourly.windDirection10m.getOrNull(it) },
+            speeds = slotIndices.map { hourly.windSpeed10m.getOrNull(it) }
+        )
+        // Indice UV : direct en prévision ; pour l'archive ERA5 (sans UV), approximation par le rayonnement global.
         val maxUv = when {
-            uvs.isNotEmpty() -> uvs.maxOrNull() ?: 2.0
-            radiations.isNotEmpty() -> ((radiations.maxOrNull() ?: 0.0) / 110.0).coerceIn(0.0, 11.0)
-            else -> if (startHourOfDay in 10..16) 4.0 else 1.0
+            uvs.isNotEmpty() -> uvs.max()
+            radiations.isNotEmpty() -> (radiations.max() / 110.0).coerceIn(0.0, 11.0)
+            else -> 0.0
         }
-        val worstWeatherCode = codes.maxOrNull() ?: when {
-            slotRain >= 3.0 -> 63
-            slotRain >= 0.3 -> 61
-            maxUv >= 5.0 -> 0
-            else -> 2
-        }
+        val worstWeatherCode = codes.maxByOrNull { weatherCodeSeverity(it) } ?: -1
 
         // Cumul de pluie des 72 heures précédant l'heure de départ
         val rain72hStartIndex = (startIndex - 72).coerceAtLeast(0)
-        val rain72hIndices = rain72hStartIndex until startIndex
-        val past72hRain = rain72hIndices.mapNotNull { hourly?.precipitation?.getOrNull(it) }.sum()
+        val past72hRain = (rain72hStartIndex until startIndex)
+            .mapNotNull { hourly.precipitation.getOrNull(it) }
+            .sum()
 
         val refTemp = computeReferenceTemp(
             realTemp = avgTemp,
@@ -456,7 +454,8 @@ object OpenMeteoClient {
             slotRainMm = slotRain,
             humidityPercent = avgHumidity,
             maxUv = maxUv,
-            sessionType = sessionType
+            sessionType = sessionType,
+            forestShare = forestShare
         )
 
         // Détail heure par heure sur le créneau
@@ -465,12 +464,12 @@ object OpenMeteoClient {
             val hourStr = iso.substringAfter('T', "").take(5).ifBlank {
                 String.format(Locale.US, "%02d:00", (startHourOfDay + (idx - startIndex)) % 24)
             }
-            val t = hourly?.temperature2m?.getOrNull(idx) ?: avgTemp
-            val r = hourly?.precipitation?.getOrNull(idx) ?: 0.0
-            val rp = hourly?.precipitationProbability?.getOrNull(idx) ?: maxRainProb
-            val w = hourly?.windSpeed10m?.getOrNull(idx) ?: maxWind
-            val wg = hourly?.windGusts10m?.getOrNull(idx) ?: maxGust
-            val wc = hourly?.weatherCode?.getOrNull(idx) ?: worstWeatherCode
+            val t = hourly.temperature2m.getOrNull(idx) ?: avgTemp
+            val r = hourly.precipitation.getOrNull(idx) ?: 0.0
+            val rp = hourly.precipitationProbability.getOrNull(idx) ?: maxRainProb
+            val w = hourly.windSpeed10m.getOrNull(idx) ?: maxWind
+            val wg = hourly.windGusts10m.getOrNull(idx) ?: maxGust
+            val wc = hourly.weatherCode.getOrNull(idx) ?: worstWeatherCode
             HourlyWeatherStep(
                 hourLabel = hourStr.replace(":", "h"),
                 tempC = (t * 10.0).roundToInt() / 10.0,
@@ -482,7 +481,7 @@ object OpenMeteoClient {
             )
         }
 
-        // Estimation de la température au point culminant si une trace GPX avec altitude est chargée
+        // Estimation de la température au point culminant (gradient standard 0,65 °C / 100 m)
         val baseEle = minTrackEleMeters?.toDouble() ?: response.elevation
         val summitTemp = if (maxTrackEleMeters != null && baseEle != null && maxTrackEleMeters - baseEle >= 150.0) {
             val deltaEle = maxTrackEleMeters - baseEle
@@ -490,21 +489,32 @@ object OpenMeteoClient {
             (est * 10.0).roundToInt() / 10.0
         } else null
 
-        val isNight = startHourOfDay < 7 || (startHourOfDay + slotHoursCount) >= 20
+        val sun = SunTimes.compute(
+            latitude = response.latitude,
+            longitude = response.longitude,
+            year = targetDate.get(Calendar.YEAR),
+            month = targetDate.get(Calendar.MONTH) + 1,
+            dayOfMonth = targetDate.get(Calendar.DAY_OF_MONTH)
+        )
+        val isNight = SunTimes.isSlotInDarkness(
+            times = sun,
+            startMinuteOfDay = startHourOfDay.coerceIn(0, 23) * 60 + safeStartMinute,
+            durationMinutes = durationMinutes
+        )
 
         return WeatherSlotAnalysis(
             locationName = locationName,
             latitude = response.latitude,
             longitude = response.longitude,
-            startDateTimeIso = times.getOrNull(startIndex) ?: (fallbackIsoPrefix + "00"),
+            startDateTimeIso = times.getOrNull(startIndex) ?: "",
             durationMinutes = durationMinutes,
             realTempC = (avgTemp * 10.0).roundToInt() / 10.0,
             apparentTempC = (avgAppTemp * 10.0).roundToInt() / 10.0,
             referenceTempC = (refTemp * 10.0).roundToInt() / 10.0,
             maxWindKmh = (maxWind * 10.0).roundToInt() / 10.0,
             maxWindGustsKmh = (maxGust * 10.0).roundToInt() / 10.0,
-            windDirectionDegrees = dominantWindDeg,
-            windDirectionCardinal = degreesToCardinalFr(dominantWindDeg),
+            windDirectionDegrees = dominantWindDeg ?: -1,
+            windDirectionCardinal = dominantWindDeg?.let { degreesToCardinalFr(it) } ?: "—",
             slotRainMm = (slotRain * 10.0).roundToInt() / 10.0,
             maxRainProbabilityPercent = maxRainProb.coerceIn(0, 100),
             past72hRainMm = (past72hRain * 10.0).roundToInt() / 10.0,
@@ -518,38 +528,92 @@ object OpenMeteoClient {
             summitElevationMeters = maxTrackEleMeters,
             fetchedAtTimeLabel = fetchedAtTimeLabel,
             isFromOfflineCache = isFromOfflineCache,
-            isNightOrDawn = isNight
+            isNightOrDawn = isNight,
+            sunriseLabel = sun?.let { SunTimes.formatMinutes(it.sunriseMinutes) },
+            sunsetLabel = sun?.let { SunTimes.formatMinutes(it.sunsetMinutes) }
         )
     }
 
     /**
-     * Analyse les prévisions d'Aujourd'hui (J0) et Demain (J1) entre 06h00 et 19h00
-     * pour identifier les 3 meilleurs créneaux météo pour courir.
+     * Direction dominante = moyenne vectorielle des directions horaires pondérées par la vitesse du vent.
+     * Renvoie null si aucune direction n'est disponible.
+     */
+    fun dominantWindDirection(directions: List<Int?>, speeds: List<Double?>): Int? {
+        var sumX = 0.0
+        var sumY = 0.0
+        var count = 0
+        directions.forEachIndexed { i, dir ->
+            if (dir != null) {
+                val weight = (speeds.getOrNull(i) ?: 1.0).coerceAtLeast(0.1)
+                val rad = Math.toRadians(dir.toDouble())
+                sumX += sin(rad) * weight
+                sumY += cos(rad) * weight
+                count++
+            }
+        }
+        if (count == 0) return null
+        if (abs(sumX) < 1e-9 && abs(sumY) < 1e-9) return directions.firstOrNull { it != null }
+        val deg = Math.toDegrees(atan2(sumX, sumY))
+        return ((deg.roundToInt() % 360) + 360) % 360
+    }
+
+    /** Gravité d'un code météo WMO, pour retenir la condition la plus défavorable du créneau. */
+    fun weatherCodeSeverity(code: Int): Int = when (code) {
+        95, 96, 99 -> 100
+        56, 57, 66, 67 -> 90
+        75, 86 -> 85
+        73, 85 -> 80
+        71, 77 -> 75
+        65, 82 -> 70
+        63, 81 -> 60
+        61, 80 -> 50
+        55 -> 45
+        53 -> 42
+        51 -> 40
+        45, 48 -> 30
+        3 -> 20
+        2 -> 15
+        1 -> 10
+        0 -> 0
+        else -> 5
+    }
+
+    /**
+     * Les 3 meilleurs créneaux d'aujourd'hui et demain, en excluant les créneaux déjà passés
+     * et ceux qui tombent de nuit (lever/coucher du soleil + marge de crépuscule).
      */
     fun findBestWeatherSlots48h(
         response: OpenMeteoForecastResponse,
         durationMinutes: Int,
-        sessionType: RunSessionType = RunSessionType.ENDURANCE
+        sessionType: RunSessionType = RunSessionType.ENDURANCE,
+        forestShare: Double = 0.0,
+        now: Calendar = Calendar.getInstance()
     ): List<BestWeatherSlotSuggestion> {
         val hourly = response.hourly ?: return emptyList()
         if (hourly.time.isEmpty()) return emptyList()
 
         val candidateHours = listOf(7, 9, 11, 14, 16, 18)
         val slotHoursCount = max(1, (durationMinutes + 59) / 60)
+        val nowMinutes = now.get(Calendar.HOUR_OF_DAY) * 60 + now.get(Calendar.MINUTE)
         val candidates = mutableListOf<BestWeatherSlotSuggestion>()
 
         for (dayOffset in 0..1) {
             val dayLabel = if (dayOffset == 0) "Aujourd'hui" else "Demain"
             for (hour in candidateHours) {
+                if (dayOffset == 0 && hour * 60 < nowMinutes + 15) continue
                 val analysis = analyzeSlotFromResponse(
                     response = response,
                     locationName = "",
                     startHourOfDay = hour,
                     dayOffsetFromToday = dayOffset,
                     durationMinutes = durationMinutes,
-                    sessionType = sessionType
-                )
-                // Score sur 100 : pénalise la pluie, la proba de pluie, le vent fort et l'écart à 13°C
+                    sessionType = sessionType,
+                    forestShare = forestShare,
+                    now = now
+                ) ?: continue
+                if (analysis.isNightOrDawn) continue
+
+                // Score sur 100 : pénalise la pluie, la proba de pluie, le vent fort et l'écart à ~13 °C
                 var score = 100.0
                 score -= analysis.slotRainMm * 18.0
                 score -= analysis.maxRainProbabilityPercent * 0.35
@@ -585,7 +649,7 @@ object OpenMeteoClient {
 
     fun weatherCodeToLabelFr(code: Int): String = when (code) {
         0 -> "Ciel dégagé"
-        1 -> " Peu nuageux".trim()
+        1 -> "Peu nuageux"
         2 -> "Éclaircies"
         3 -> "Couvert"
         45, 48 -> "Brouillard"
@@ -601,6 +665,7 @@ object OpenMeteoClient {
         82 -> "Averses violentes"
         85, 86 -> "Averses de neige"
         95, 96, 99 -> "Orage"
+        -1 -> "Conditions inconnues"
         else -> "Variable"
     }
 
@@ -611,6 +676,10 @@ object OpenMeteoClient {
         return directions[idx]
     }
 
+    /**
+     * Température de référence pour choisir la tenue.
+     * [forestShare] (0..1) = part de la trace en forêt : le vent y est compté moitié moins.
+     */
     fun computeReferenceTemp(
         realTemp: Double,
         windKmh: Double,
@@ -618,17 +687,19 @@ object OpenMeteoClient {
         slotRainMm: Double,
         humidityPercent: Int = 65,
         maxUv: Double,
-        sessionType: RunSessionType
+        sessionType: RunSessionType,
+        forestShare: Double = 0.0
     ): Double {
         val safeTemp = if (realTemp.isFinite()) realTemp.coerceIn(-40.0, 55.0) else 12.0
-        val safeWind = if (windKmh.isFinite()) windKmh.coerceIn(0.0, 180.0) else 10.0
+        val safeWind = if (windKmh.isFinite()) windKmh.coerceIn(0.0, 180.0) else 0.0
         val safeGusts = if (windGustsKmh.isFinite()) windGustsKmh.coerceIn(0.0, 220.0) else safeWind
         val safeRain = if (slotRainMm.isFinite()) slotRainMm.coerceIn(0.0, 200.0) else 0.0
-        val safeUv = if (maxUv.isFinite()) maxUv.coerceIn(0.0, 16.0) else 1.0
+        val safeUv = if (maxUv.isFinite()) maxUv.coerceIn(0.0, 16.0) else 0.0
+        val safeForest = if (forestShare.isFinite()) forestShare.coerceIn(0.0, 1.0) else 0.0
 
         var ref = safeTemp
-        // Effet du vent moyen et des rafales
-        val effectiveWind = max(safeWind, safeGusts * 0.75)
+        // Effet du vent moyen et des rafales (réduit de moitié sur la part en forêt)
+        val effectiveWind = max(safeWind, safeGusts * 0.75) * (1.0 - 0.5 * safeForest)
         if (effectiveWind >= 35.0) ref -= 3.5
         else if (effectiveWind >= 20.0) ref -= 2.0
         else if (effectiveWind >= 12.0) ref -= 1.0
@@ -651,44 +722,5 @@ object OpenMeteoClient {
         // Intensité de la séance (Course / Fractionné réchauffe davantage)
         ref += sessionType.tempOffset
         return ref
-    }
-
-    fun fallbackAnalysis(
-        locationName: String,
-        latitude: Double,
-        longitude: Double,
-        startHourOfDay: Int,
-        durationMinutes: Int,
-        sessionType: RunSessionType
-    ): WeatherSlotAnalysis {
-        val realTemp = 11.0
-        val wind = 15.0
-        val rain = 0.0
-        val uv = if (startHourOfDay in 10..16) 4.0 else 1.0
-        val refTemp = computeReferenceTemp(
-            realTemp = realTemp,
-            windKmh = wind,
-            slotRainMm = rain,
-            maxUv = uv,
-            sessionType = sessionType
-        )
-        return WeatherSlotAnalysis(
-            locationName = locationName,
-            latitude = latitude,
-            longitude = longitude,
-            startDateTimeIso = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date()) + "T${String.format(Locale.US, "%02d", startHourOfDay)}:00",
-            durationMinutes = durationMinutes,
-            realTempC = realTemp,
-            apparentTempC = 10.0,
-            referenceTempC = (refTemp * 10.0).roundToInt() / 10.0,
-            maxWindKmh = wind,
-            maxWindGustsKmh = 22.0,
-            slotRainMm = rain,
-            past72hRainMm = 8.5,
-            maxUvIndex = uv,
-            weatherConditionLabel = "Variable (hors-ligne)",
-            isFromOfflineCache = true,
-            isNightOrDawn = startHourOfDay < 7 || startHourOfDay >= 20
-        )
     }
 }

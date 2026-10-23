@@ -159,7 +159,7 @@ fun RunCoachApp(
                                 onPlannedDistanceChange = viewModel::updatePlannedDistance,
                                 onElevationGainChange = viewModel::updateElevationGainDPlus,
                                 onPaceChange = viewModel::updatePaceSecPerKm,
-                                onImportGpxXml = viewModel::importGpxFromXmlString,
+                                onImportGpxUri = viewModel::importGpxFromUri,
                                 onRetryOverpassAnalysis = viewModel::retryGpxSurfaceAnalysis,
                                 onApplyCustomSurfaceBreakdown = viewModel::updateCustomSurfaceBreakdown,
                                 onClearGpx = viewModel::clearImportedGpx,
@@ -173,13 +173,11 @@ fun RunCoachApp(
                                 onStartNewRunReset = viewModel::startNewRunPreparation,
                                 onClearBanner = viewModel::clearBannerMessage,
                                 onSelectManualShoe = viewModel::selectManualShoe,
-                                onApplyWeatherScenario = viewModel::applyWeatherScenarioOverride,
                                 onToggleChecklist = viewModel::toggleChecklistItem,
                                 onAddChecklist = viewModel::addChecklistItem,
                                 onDeleteChecklist = viewModel::deleteChecklistItem,
                                 onResetBeforeChecklist = viewModel::resetBeforeStartChecklist,
                                 onUpdateRetroConfig = viewModel::updateRetroplanningConfig,
-                                onScheduleRetroNotifications = viewModel::scheduleRaceNotifications,
                                 onThermalProfileChange = viewModel::updateThermalProfile,
                                 onWaterRefillCountChange = viewModel::updateWaterRefillCount,
                                 onApplyBestWeatherSlot = viewModel::applyBestWeatherSlot,
@@ -198,7 +196,9 @@ fun RunCoachApp(
                                 onAddCustomGear = viewModel::addCustomGearItem,
                                 onUpdateNutritionSettings = { med, long, gelG, asphaltPct ->
                                     viewModel.updateNutritionRatesManually(med, long, gelG, asphaltPct)
-                                }
+                                },
+                                onExportBackup = viewModel::exportBackup,
+                                onImportBackup = viewModel::importBackup
                             )
                         }
 

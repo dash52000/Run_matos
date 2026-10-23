@@ -5,11 +5,9 @@ import com.example.data.model.GpxPoint
 import com.example.data.model.GpxSurfaceBreakdown
 import com.example.data.model.GpxTrackAnalysis
 import com.example.data.model.SurfaceCategory
-import com.example.data.model.TerrainType
 import com.squareup.moshi.Json
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
-import okhttp3.Dns
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import org.xmlpull.v1.XmlPullParser
@@ -24,7 +22,6 @@ import retrofit2.http.Query
 import retrofit2.http.Url
 import java.io.IOException
 import java.io.StringReader
-import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.security.MessageDigest
@@ -74,43 +71,11 @@ object GpxAndOverpassAnalyzer {
     // Cache mémoire des analyses de revêtement réussies par hash de trace pour ne pas refaire l'appel
     private val surfaceAnalysisCache = ConcurrentHashMap<String, GpxSurfaceBreakdown>()
 
-    // Résolveur DNS résilient : si le résolveur Android / émulateur échoue à résoudre l'hôte, bascule sur les adresses IPv4 directes
-    private val resilientDns = object : Dns {
-        private val staticIps = mapOf(
-            "overpass.osm.ch" to listOf(
-                InetAddress.getByAddress("overpass.osm.ch", byteArrayOf(95.toByte(), 128.toByte(), 34.toByte(), 81.toByte()))
-            ),
-            "overpass-api.de" to listOf(
-                InetAddress.getByAddress("overpass-api.de", byteArrayOf(65.toByte(), 109.toByte(), 112.toByte(), 52.toByte())),
-                InetAddress.getByAddress("overpass-api.de", byteArrayOf(162.toByte(), 55.toByte(), 144.toByte(), 139.toByte()))
-            ),
-            "lz4.overpass-api.de" to listOf(
-                InetAddress.getByAddress("lz4.overpass-api.de", byteArrayOf(65.toByte(), 109.toByte(), 112.toByte(), 52.toByte()))
-            ),
-            "z.overpass-api.de" to listOf(
-                InetAddress.getByAddress("z.overpass-api.de", byteArrayOf(162.toByte(), 55.toByte(), 144.toByte(), 139.toByte()))
-            )
-        )
-
-        override fun lookup(hostname: String): List<InetAddress> {
-            val lower = hostname.lowercase(Locale.ROOT)
-            return try {
-                val resolved = Dns.SYSTEM.lookup(hostname)
-                if (resolved.isNotEmpty()) resolved else staticIps[lower] ?: emptyList()
-            } catch (_: UnknownHostException) {
-                staticIps[lower] ?: throw UnknownHostException("Impossible de résoudre le serveur OSM ($hostname)")
-            } catch (_: Exception) {
-                staticIps[lower] ?: throw UnknownHostException("Erreur DNS sur le serveur OSM ($hostname)")
-            }
-        }
-    }
-
-    // Liste de serveurs Overpass publics fiables avec bascule automatique (failover)
+    // Serveurs Overpass publics à couverture mondiale (wiki OSM) avec bascule automatique.
+    // (overpass.osm.ch, utilisé auparavant en premier, ne couvre que la Suisse : il renvoyait une réponse vide.)
     private val overpassEndpoints = listOf(
-        "https://overpass.osm.ch/api/interpreter",
-        "https://lz4.overpass-api.de/api/interpreter",
-        "https://z.overpass-api.de/api/interpreter",
-        "https://overpass-api.de/api/interpreter"
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter"
     )
 
     private val moshi: Moshi = Moshi.Builder()
@@ -129,32 +94,32 @@ object GpxAndOverpassAnalyzer {
     }
 
     private val okHttpClient: OkHttpClient = OkHttpClient.Builder()
-        .dns(resilientDns)
         .addInterceptor(userAgentInterceptor)
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(25, TimeUnit.SECONDS)
         .writeTimeout(8, TimeUnit.SECONDS)
         .build()
 
     private val overpassService: OverpassApiService by lazy {
         Retrofit.Builder()
-            .baseUrl("https://overpass.osm.ch/")
+            .baseUrl("https://overpass-api.de/")
             .client(okHttpClient)
             .addConverterFactory(MoshiConverterFactory.create(moshi))
             .build()
             .create(OverpassApiService::class.java)
     }
 
-    init {
-        prepopulateSampleCaches()
-    }
+    /** Seuil d'hystérésis du D+ : les variations d'altitude plus petites sont du bruit GPS/baro. */
+    const val ELEVATION_HYSTERESIS_METERS = 3.0
 
     /**
-     * Parse un contenu XML GPX, extrait le nom de la trace, les points (trkpt / rtept / wpt),
-     * calcule la distance totale (km), le dénivelé positif cumulé D+ (m) et le point de départ.
+     * Parse un contenu XML GPX, extrait le nom de la trace et les points de trace (trkpt),
+     * ou à défaut d'itinéraire (rtept). Les waypoints (wpt : ravitos, points d'intérêt) sont ignorés
+     * car ils ne font pas partie du tracé. Calcule la distance totale (km), le D+ (m) et le point de départ.
      */
     fun parseGpxContent(rawXml: String, fallbackName: String = "Trace GPX importée"): GpxTrackAnalysis? {
-        val points = mutableListOf<GpxPoint>()
+        val trackPoints = mutableListOf<GpxPoint>()
+        val routePoints = mutableListOf<GpxPoint>()
         var trackName: String? = null
 
         try {
@@ -170,6 +135,7 @@ object GpxAndOverpassAnalyzer {
             var currentLon: Double? = null
             var currentEle: Double? = null
             var insidePoint = false
+            var currentPointKind = ""
             var currentTag = ""
 
             while (eventType != XmlPullParser.END_DOCUMENT) {
@@ -179,6 +145,7 @@ object GpxAndOverpassAnalyzer {
                         currentTag = tag
                         if (tag == "trkpt" || tag == "rtept" || tag == "wpt") {
                             insidePoint = true
+                            currentPointKind = tag
                             currentLat = parser.getAttributeValue(null, "lat")?.toDoubleOrNull()
                             currentLon = parser.getAttributeValue(null, "lon")?.toDoubleOrNull()
                             currentEle = null
@@ -197,15 +164,18 @@ object GpxAndOverpassAnalyzer {
                     XmlPullParser.END_TAG -> {
                         val tag = parser.name.lowercase(Locale.ROOT).substringAfterLast(':')
                         if (tag == "trkpt" || tag == "rtept" || tag == "wpt") {
-                            if (currentLat != null && currentLon != null &&
+                            if (currentPointKind != "wpt" &&
+                                currentLat != null && currentLon != null &&
                                 currentLat.isFinite() && currentLat in -90.0..90.0 &&
                                 currentLon.isFinite() && currentLon in -180.0..180.0
                             ) {
                                 // Valider et borner l'altitude (entre -500m et 9000m pour éliminer les codes d'erreur 99999m)
                                 val sanitizedEle = currentEle?.takeIf { it.isFinite() && it in -500.0..9000.0 }
-                                points.add(GpxPoint(lat = currentLat, lon = currentLon, ele = sanitizedEle))
+                                val point = GpxPoint(lat = currentLat, lon = currentLon, ele = sanitizedEle)
+                                if (currentPointKind == "trkpt") trackPoints.add(point) else routePoints.add(point)
                             }
                             insidePoint = false
+                            currentPointKind = ""
                         }
                         currentTag = ""
                     }
@@ -216,6 +186,8 @@ object GpxAndOverpassAnalyzer {
             return null
         }
 
+        // Trace enregistrée en priorité ; sinon l'itinéraire (rtept) d'un fichier de planification.
+        val points = if (trackPoints.size >= 2) trackPoints else routePoints
         if (points.size < 2) return null
 
         // Protection mémoire pour les fichiers GPX massifs (> 30 000 points) : sous-échantillonnage régulier
@@ -235,7 +207,7 @@ object GpxAndOverpassAnalyzer {
         var dPlusMeters = 0.0
         var lastEle: Double? = workingPoints.first().ele
 
-        // Lissage du bruit d'altitude GPS et élimination des faux décrochages (sauts > 120m sans déplacement horizontal)
+        // Hystérésis de 3 m contre le bruit d'altitude et élimination des faux décrochages (sauts > 120 m sans déplacement horizontal)
         for (i in 0 until workingPoints.lastIndex) {
             val p1 = workingPoints[i]
             val p2 = workingPoints[i + 1]
@@ -249,10 +221,10 @@ object GpxAndOverpassAnalyzer {
                 val diff = ele2 - lastEle
                 val isGpsGlitch = diff > 120.0 && segLen < 15.0 // artefact de signal
                 if (!isGpsGlitch) {
-                    if (diff >= 1.0) {
+                    if (diff >= ELEVATION_HYSTERESIS_METERS) {
                         dPlusMeters += diff
                         lastEle = ele2
-                    } else if (diff <= -1.0) {
+                    } else if (diff <= -ELEVATION_HYSTERESIS_METERS) {
                         lastEle = ele2
                     }
                 }
@@ -261,9 +233,9 @@ object GpxAndOverpassAnalyzer {
             }
         }
 
-        val distanceKm = if (totalDistanceMeters.isFinite() && totalDistanceMeters > 0.0) {
-            (((totalDistanceMeters / 1000.0) * 10.0).roundToInt() / 10.0).coerceIn(0.1, 1000.0)
-        } else 1.0
+        // Une trace sans longueur mesurable est invalide : on ne lui invente pas de distance.
+        if (!totalDistanceMeters.isFinite() || totalDistanceMeters < 50.0) return null
+        val distanceKm = (((totalDistanceMeters / 1000.0) * 10.0).roundToInt() / 10.0).coerceIn(0.1, 1000.0)
 
         val safeDPlus = if (dPlusMeters.isFinite() && dPlusMeters >= 0.0) {
             dPlusMeters.roundToInt().coerceIn(0, 20000)
@@ -314,14 +286,13 @@ object GpxAndOverpassAnalyzer {
      * avec leurs tags highway, surface et tracktype.
      * - Pour éviter les timeouts (504) sur de grandes traces, découpe l'emprise en sous-boîtes + 50 m
      *   le long du corridor de la trace lorsque la diagonale dépasse 3,5 km.
-     * - Interroge automatiquement plusieurs miroirs Overpass publics en cas d'indisponibilité d'un serveur.
-     * - Si aucun miroir n'est joignable (hors-ligne, DNS défaillant, timeout), bascule automatiquement
-     *   sur une estimation cohérente selon le terrain choisi et le profil D+/km de la trace.
+     * - Interroge plusieurs serveurs Overpass publics (couverture mondiale) en cas d'indisponibilité.
+     * - Si aucun serveur ne répond, renvoie un revêtement 100 % « inconnu » avec le message d'erreur :
+     *   aucune répartition n'est inventée, et ce résultat n'est pas mis en cache pour pouvoir réessayer.
      */
     suspend fun analyzeSurfaceWithOverpass(
         track: GpxTrackAnalysis,
-        forceRefresh: Boolean = false,
-        fallbackTerrain: TerrainType = TerrainType.TRAIL
+        forceRefresh: Boolean = false
     ): GpxSurfaceBreakdown {
         if (!forceRefresh) {
             surfaceAnalysisCache[track.trackIdHash]?.let { return it }
@@ -333,129 +304,80 @@ object GpxAndOverpassAnalyzer {
         val rawSegments = buildTrackSegments(pts)
         val totalMeters = rawSegments.sumOf { it.lengthMeters }.coerceAtLeast(1.0)
 
-        val overpassQuery = buildOptimizedOverpassQuery(pts)
         var lastError: Exception? = null
+        var gotEmptyAnswer = false
 
-        for (endpoint in overpassEndpoints) {
-            try {
-                val response = try {
-                    overpassService.queryOverpassPost(endpoint, overpassQuery)
-                } catch (_: Exception) {
-                    overpassService.queryOverpassGet(endpoint, overpassQuery)
+        for (query in listOf(buildOptimizedOverpassQuery(pts), buildSingleBboxOverpassQuery(pts)).distinct()) {
+            for (endpoint in overpassEndpoints) {
+                try {
+                    val response = try {
+                        overpassService.queryOverpassPost(endpoint, query)
+                    } catch (_: Exception) {
+                        overpassService.queryOverpassGet(endpoint, query)
+                    }
+                    val ways = response.elements.orEmpty()
+                        .filter { it.type == "way" && !it.geometry.isNullOrEmpty() }
+                        .distinctBy { it.id }
+                    if (ways.isEmpty()) {
+                        // Réponse vide : on tente le serveur suivant plutôt que de conclure « 100 % inconnu ».
+                        gotEmptyAnswer = true
+                        continue
+                    }
+
+                    val result = computeSurfaceBreakdownFromWays(rawSegments, ways, totalMeters)
+                    surfaceAnalysisCache[track.trackIdHash] = result
+                    return result
+                } catch (e: Exception) {
+                    lastError = e
                 }
-                val ways = response.elements.orEmpty()
-                    .filter { it.type == "way" && !it.geometry.isNullOrEmpty() }
-                    .distinctBy { it.id }
-
-                val result = computeSurfaceBreakdownFromWays(rawSegments, ways, totalMeters)
-                surfaceAnalysisCache[track.trackIdHash] = result
-                return result
-            } catch (e: Exception) {
-                lastError = e
             }
         }
 
-        // Si la requête corridor a échoué sur tous les miroirs, tentative avec la boîte englobante simple
-        val simpleQuery = buildSingleBboxOverpassQuery(pts)
-        for (endpoint in overpassEndpoints.take(2)) {
-            try {
-                val response = overpassService.queryOverpassPost(endpoint, simpleQuery)
-                val ways = response.elements.orEmpty()
-                    .filter { it.type == "way" && !it.geometry.isNullOrEmpty() }
-                    .distinctBy { it.id }
-
-                val result = computeSurfaceBreakdownFromWays(rawSegments, ways, totalMeters)
-                surfaceAnalysisCache[track.trackIdHash] = result
-                return result
-            } catch (e: Exception) {
-                lastError = e
-            }
+        val message = if (gotEmptyAnswer && lastError == null) {
+            "Aucune voie OpenStreetMap trouvée autour de la trace : revêtement inconnu."
+        } else {
+            formatFriendlyNetworkError(lastError) + " Revêtement inconnu, règles chaussures classiques."
         }
-
-        val friendlyError = formatFriendlyNetworkError(lastError)
-        val fallback = buildEstimatedSurfaceBreakdown(track, fallbackTerrain, friendlyError)
-        surfaceAnalysisCache[track.trackIdHash] = fallback
-        return fallback
+        return buildUnknownSurfaceBreakdown(rawSegments, totalMeters, message)
     }
 
     private fun formatFriendlyNetworkError(e: Throwable?): String {
         return when (e) {
-            is UnknownHostException -> "Serveur Overpass injoignable (hors-ligne ou échec de résolution réseau)."
+            is UnknownHostException -> "Serveur Overpass injoignable (hors-ligne ?)."
             is SocketTimeoutException -> "Délai d'attente dépassé (serveur OSM saturé)."
             is IOException -> "Connexion au serveur OpenStreetMap interrompue."
             else -> "Serveur Overpass momentanément indisponible."
         }
     }
 
-    /**
-     * Construit une estimation de secours du revêtement basée sur le terrain
-     * choisi et le profil altimétrique (gradient D+/km) de la trace.
-     */
-    fun buildEstimatedSurfaceBreakdown(
-        track: GpxTrackAnalysis,
-        fallbackTerrain: TerrainType = TerrainType.TRAIL,
-        friendlyError: String? = null
+    /** Revêtement 100 % inconnu (trace grise) quand OSM ne fournit rien : rien n'est estimé. */
+    internal fun buildUnknownSurfaceBreakdown(
+        rawSegments: List<RawTrackSegment>,
+        totalMeters: Double,
+        message: String
     ): GpxSurfaceBreakdown {
-        val rawSegments = buildTrackSegments(track.points)
-        val totalMeters = rawSegments.sumOf { it.lengthMeters }.coerceAtLeast(1.0)
-        val gradient = (track.elevationGainDPlusMeters / track.totalDistanceKm.coerceAtLeast(0.1))
-
-        val (bitumePct, cheminPct, terrePct) = when (fallbackTerrain) {
-            TerrainType.ROUTE -> Triple(85.0, 15.0, 0.0)
-            TerrainType.TRAIL -> {
-                if (gradient >= 40.0) Triple(5.0, 20.0, 75.0)
-                else Triple(10.0, 35.0, 55.0)
-            }
-        }
-
-        val bitumeMeters = (totalMeters * bitumePct / 100.0)
-        val cheminMeters = (totalMeters * cheminPct / 100.0)
-        val terreMeters = (totalMeters * terrePct / 100.0)
-
-        val minEle = track.minElevationMeters?.toDouble() ?: 0.0
-        val maxEle = track.maxElevationMeters?.toDouble() ?: (minEle + 100.0)
-        val eleRange = (maxEle - minEle).coerceAtLeast(10.0)
-
-        val colored = rawSegments.mapIndexed { idx, seg ->
-            val segEle = track.points.getOrNull(idx * max(1, track.points.size / rawSegments.size.coerceAtLeast(1)))?.ele ?: minEle
-            val relEle = ((segEle - minEle) / eleRange).coerceIn(0.0, 1.0)
-            val cat = when {
-                relEle < (bitumePct / 100.0).coerceAtMost(0.35) && bitumePct > 5.0 -> SurfaceCategory.BITUME
-                relEle < ((bitumePct + cheminPct) / 100.0) -> SurfaceCategory.CHEMIN_STABILISE
-                terrePct > 0 -> SurfaceCategory.TERRE_FORET
-                cheminPct > 0 -> SurfaceCategory.CHEMIN_STABILISE
-                else -> SurfaceCategory.BITUME
-            }
-            GpxColoredSegment(
-                startLat = seg.startLat,
-                startLon = seg.startLon,
-                endLat = seg.endLat,
-                endLon = seg.endLon,
-                lengthMeters = seg.lengthMeters,
-                category = cat
-            )
-        }
-
         return GpxSurfaceBreakdown(
-            bitumeMeters = bitumeMeters,
-            cheminStabiliseMeters = cheminMeters,
-            terreForetMeters = terreMeters,
-            inconnuMeters = 0.0,
+            bitumeMeters = 0.0,
+            cheminStabiliseMeters = 0.0,
+            terreForetMeters = 0.0,
+            inconnuMeters = totalMeters,
             totalMeters = totalMeters,
-            bitumePercent = bitumePct,
-            cheminStabilisePercent = cheminPct,
-            terreForetPercent = terrePct,
-            inconnuPercent = 0.0,
-            isUnreliable = false,
-            coloredSegments = colored,
-            overpassError = friendlyError ?: "Serveur Overpass indisponible : estimation appliquée selon votre terrain (${fallbackTerrain.label}).",
-            isManualOrOfflineEstimate = true
+            bitumePercent = 0.0,
+            cheminStabilisePercent = 0.0,
+            terreForetPercent = 0.0,
+            inconnuPercent = 100.0,
+            isUnreliable = true,
+            coloredSegments = rawSegments.map {
+                GpxColoredSegment(it.startLat, it.startLon, it.endLat, it.endLon, it.lengthMeters, SurfaceCategory.INCONNU)
+            },
+            overpassError = message,
+            isManualOrOfflineEstimate = false
         )
     }
 
     /**
-     * Permet à l'utilisateur d'appliquer manuellement une répartition de revêtement
-     * personnalisée en cas d'indisponibilité d'Overpass ou pour affiner le calcul.
+     * Répartition de revêtement saisie à la main. Les % s'appliquent au choix des chaussures,
+     * mais la carte reste grise : on ne sait pas où se trouve chaque portion sur la trace.
      */
     fun buildCustomSurfaceBreakdown(
         track: GpxTrackAnalysis,
@@ -465,36 +387,18 @@ object GpxAndOverpassAnalyzer {
     ): GpxSurfaceBreakdown {
         val rawSegments = buildTrackSegments(track.points)
         val totalMeters = rawSegments.sumOf { it.lengthMeters }.coerceAtLeast(1.0)
-        val totalPct = (bitumePct + cheminPct + terrePct).coerceAtLeast(1.0)
-        val normBitume = (bitumePct / totalPct) * 100.0
-        val normChemin = (cheminPct / totalPct) * 100.0
-        val normTerre = (terrePct / totalPct) * 100.0
-
-        val bitumeMeters = (totalMeters * normBitume / 100.0)
-        val cheminMeters = (totalMeters * normChemin / 100.0)
-        val terreMeters = (totalMeters * normTerre / 100.0)
-
-        val colored = rawSegments.mapIndexed { idx, seg ->
-            val ratio = idx.toDouble() / rawSegments.size.coerceAtLeast(1)
-            val cat = when {
-                ratio < (normBitume / 100.0) -> SurfaceCategory.BITUME
-                ratio < ((normBitume + normChemin) / 100.0) -> SurfaceCategory.CHEMIN_STABILISE
-                else -> SurfaceCategory.TERRE_FORET
-            }
-            GpxColoredSegment(
-                startLat = seg.startLat,
-                startLon = seg.startLon,
-                endLat = seg.endLat,
-                endLon = seg.endLon,
-                lengthMeters = seg.lengthMeters,
-                category = cat
-            )
+        val rawTotal = bitumePct.coerceAtLeast(0.0) + cheminPct.coerceAtLeast(0.0) + terrePct.coerceAtLeast(0.0)
+        if (rawTotal < 1.0) {
+            return buildUnknownSurfaceBreakdown(rawSegments, totalMeters, "Répartition manuelle vide : revêtement inconnu.")
         }
+        val normBitume = (bitumePct.coerceAtLeast(0.0) / rawTotal) * 100.0
+        val normChemin = (cheminPct.coerceAtLeast(0.0) / rawTotal) * 100.0
+        val normTerre = (terrePct.coerceAtLeast(0.0) / rawTotal) * 100.0
 
         return GpxSurfaceBreakdown(
-            bitumeMeters = bitumeMeters,
-            cheminStabiliseMeters = cheminMeters,
-            terreForetMeters = terreMeters,
+            bitumeMeters = totalMeters * normBitume / 100.0,
+            cheminStabiliseMeters = totalMeters * normChemin / 100.0,
+            terreForetMeters = totalMeters * normTerre / 100.0,
             inconnuMeters = 0.0,
             totalMeters = totalMeters,
             bitumePercent = ((normBitume * 10.0).roundToInt()) / 10.0,
@@ -502,79 +406,12 @@ object GpxAndOverpassAnalyzer {
             terreForetPercent = ((normTerre * 10.0).roundToInt()) / 10.0,
             inconnuPercent = 0.0,
             isUnreliable = false,
-            coloredSegments = colored,
+            coloredSegments = rawSegments.map {
+                GpxColoredSegment(it.startLat, it.startLon, it.endLat, it.endLon, it.lengthMeters, SurfaceCategory.INCONNU)
+            },
             overpassError = null,
             isManualOrOfflineEstimate = true
         )
-    }
-
-    private fun prepopulateSampleCaches() {
-        try {
-            val trailXml = getSampleTrailGpxXml()
-            val trailHash = sha256Short(trailXml)
-            val trailTrack = parseGpxContent(trailXml, "Boucle Petit Balcon Chamonix (Trail)")
-            if (trailTrack != null) {
-                val segs = buildTrackSegments(trailTrack.points)
-                val totalM = segs.sumOf { it.lengthMeters }.coerceAtLeast(1.0)
-                val colored = segs.mapIndexed { idx, seg ->
-                    val ratio = idx.toDouble() / segs.size.coerceAtLeast(1)
-                    val cat = when {
-                        ratio < 0.07 -> SurfaceCategory.BITUME
-                        ratio < 0.22 -> SurfaceCategory.CHEMIN_STABILISE
-                        else -> SurfaceCategory.TERRE_FORET
-                    }
-                    GpxColoredSegment(seg.startLat, seg.startLon, seg.endLat, seg.endLon, seg.lengthMeters, cat)
-                }
-                surfaceAnalysisCache[trailHash] = GpxSurfaceBreakdown(
-                    bitumeMeters = totalM * 0.07,
-                    cheminStabiliseMeters = totalM * 0.15,
-                    terreForetMeters = totalM * 0.78,
-                    inconnuMeters = 0.0,
-                    totalMeters = totalM,
-                    bitumePercent = 7.0,
-                    cheminStabilisePercent = 15.0,
-                    terreForetPercent = 78.0,
-                    inconnuPercent = 0.0,
-                    isUnreliable = false,
-                    coloredSegments = colored,
-                    overpassError = null,
-                    isManualOrOfflineEstimate = false
-                )
-            }
-
-            val roadXml = getSampleRoadDominantGpxXml()
-            val roadHash = sha256Short(roadXml)
-            val roadTrack = parseGpxContent(roadXml, "Parc & Berges d'Annecy (Mixte 70% Bitume)")
-            if (roadTrack != null) {
-                val segs = buildTrackSegments(roadTrack.points)
-                val totalM = segs.sumOf { it.lengthMeters }.coerceAtLeast(1.0)
-                val colored = segs.mapIndexed { idx, seg ->
-                    val ratio = idx.toDouble() / segs.size.coerceAtLeast(1)
-                    val cat = when {
-                        ratio < 0.70 -> SurfaceCategory.BITUME
-                        ratio < 0.92 -> SurfaceCategory.CHEMIN_STABILISE
-                        else -> SurfaceCategory.TERRE_FORET
-                    }
-                    GpxColoredSegment(seg.startLat, seg.startLon, seg.endLat, seg.endLon, seg.lengthMeters, cat)
-                }
-                surfaceAnalysisCache[roadHash] = GpxSurfaceBreakdown(
-                    bitumeMeters = totalM * 0.70,
-                    cheminStabiliseMeters = totalM * 0.22,
-                    terreForetMeters = totalM * 0.08,
-                    inconnuMeters = 0.0,
-                    totalMeters = totalM,
-                    bitumePercent = 70.0,
-                    cheminStabilisePercent = 22.0,
-                    terreForetPercent = 8.0,
-                    inconnuPercent = 0.0,
-                    isUnreliable = false,
-                    coloredSegments = colored,
-                    overpassError = null,
-                    isManualOrOfflineEstimate = false
-                )
-            }
-        } catch (_: Exception) {
-        }
     }
 
     /**
@@ -915,46 +752,4 @@ object GpxAndOverpassAnalyzer {
         val bytes = MessageDigest.getInstance("SHA-256").digest(input.toByteArray())
         return bytes.take(8).joinToString("") { "%02x".format(it) }
     }
-
-    fun getSampleTrailGpxXml(): String = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <gpx version="1.1" creator="RunCoach Matos">
-          <trk>
-            <name>Boucle Petit Balcon Chamonix (Trail)</name>
-            <trkseg>
-              <trkpt lat="45.9237" lon="6.8694"><ele>1035</ele></trkpt>
-              <trkpt lat="45.9265" lon="6.8732"><ele>1085</ele></trkpt>
-              <trkpt lat="45.9301" lon="6.8785"><ele>1140</ele></trkpt>
-              <trkpt lat="45.9348" lon="6.8840"><ele>1210</ele></trkpt>
-              <trkpt lat="45.9395" lon="6.8895"><ele>1265</ele></trkpt>
-              <trkpt lat="45.9430" lon="6.8950"><ele>1310</ele></trkpt>
-              <trkpt lat="45.9402" lon="6.8982"><ele>1245</ele></trkpt>
-              <trkpt lat="45.9355" lon="6.8915"><ele>1180</ele></trkpt>
-              <trkpt lat="45.9300" lon="6.8830"><ele>1110</ele></trkpt>
-              <trkpt lat="45.9258" lon="6.8750"><ele>1060</ele></trkpt>
-              <trkpt lat="45.9237" lon="6.8694"><ele>1035</ele></trkpt>
-            </trkseg>
-          </trk>
-        </gpx>
-    """.trimIndent()
-
-    fun getSampleRoadDominantGpxXml(): String = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <gpx version="1.1" creator="RunCoach Matos">
-          <trk>
-            <name>Parc &amp; Berges d'Annecy (Mixte 70% Bitume)</name>
-            <trkseg>
-              <trkpt lat="45.9012" lon="6.1288"><ele>448</ele></trkpt>
-              <trkpt lat="45.9025" lon="6.1345"><ele>450</ele></trkpt>
-              <trkpt lat="45.9040" lon="6.1410"><ele>452</ele></trkpt>
-              <trkpt lat="45.9052" lon="6.1475"><ele>455</ele></trkpt>
-              <trkpt lat="45.9065" lon="6.1530"><ele>462</ele></trkpt>
-              <trkpt lat="45.9045" lon="6.1505"><ele>454</ele></trkpt>
-              <trkpt lat="45.9030" lon="6.1430"><ele>450</ele></trkpt>
-              <trkpt lat="45.9018" lon="6.1355"><ele>449</ele></trkpt>
-              <trkpt lat="45.9012" lon="6.1288"><ele>448</ele></trkpt>
-            </trkseg>
-          </trk>
-        </gpx>
-    """.trimIndent()
 }
